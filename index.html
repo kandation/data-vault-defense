@@ -833,6 +833,11 @@ background:linear-gradient(#2c4570,#2c4570) 4px 4px/72px 104px no-repeat}
 }
 @media (max-height:640px) and (max-width:759px){.speech{min-height:60px}.coach,.say,.strip,.toast{min-height:56px}}
 .saver .banner,.saver .card,.saver .dpg,.saver .rbtn,.saver .shake,.saver .stampfx{animation:none!important}
+
+/* NOTHING on screen can be selected (a double tap or a long press used to leave blue selection boxes over the UI), except what the player must copy or type:
+   the ref code, resume / save codes, text fields.  Add class "selectable" to any other text that has to stay copyable. */
+html,body,body *{-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+body input,body textarea,body select,body [contenteditable="true"],body .selectable,body .selectable *,body .refcode,body .refcode *,body .codebox,body .codebox *,body [data-ref],body [data-resume-code],body .resumein{-webkit-user-select:text;user-select:text;-webkit-touch-callout:default}
 ` + ONBOARD_CSS;
 
 Object.defineProperty(__exp, "GAME_CSS", { enumerable: true, get: () => GAME_CSS });
@@ -29010,7 +29015,7 @@ Object.defineProperty(__exp, "STARS_CSS", { enumerable: true, get: () => STARS_C
 __defs["src/core/version.js"] = function(__exp, __req, __dyn) {
 // Build stamp shown on the title screen (and in <html data-build>) so anyone can tell which build they are playing.
 // `node tools/build.mjs` replaces the value with 'YYYY-MM-DD HH:mm · <git short hash>'; the dev server shows 'dev'.
-const BUILD = "2026-10-30 14:01 · 168cb2d";
+const BUILD = "2026-10-30 14:58 · 4dd5878";
 
 Object.defineProperty(__exp, "BUILD", { enumerable: true, get: () => BUILD });
 };
