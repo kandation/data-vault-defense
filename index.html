@@ -1723,7 +1723,7 @@ __defs["src/metrics/config.js"] = function(__exp, __req, __dyn) {
 //   3. CFG.ENDPOINT below     (edit once after deploying apps-script/Code.gs, or: node tools/build.mjs --endpoint <url>)
 // Empty = no endpoint: the long backup code stays visible and can be given to the admin.
 const CFG = {
-  ENDPOINT: "https://tpdv-results.kandation.workers.dev", /*ENDPOINT*/
+  ENDPOINT: "https://script.google.com/macros/s/AKfycbweP87qVZ5b3O4OaM9fS7g3OmgiN3RAxQroZIIB-wiO-FDSTv9n2AkNnCq9HFuPH0VV/exec", /*ENDPOINT*/
   FORM_URL: 'https://forms.gle/Td35cbx9Xfk9ucvr8', // the Google Form the ref code is entered into (level-1 / Pre / Post end popup: 'เปิด Google Form'); empty = the popup shows copy-only
 
 };
@@ -29010,7 +29010,7 @@ Object.defineProperty(__exp, "STARS_CSS", { enumerable: true, get: () => STARS_C
 __defs["src/core/version.js"] = function(__exp, __req, __dyn) {
 // Build stamp shown on the title screen (and in <html data-build>) so anyone can tell which build they are playing.
 // `node tools/build.mjs` replaces the value with 'YYYY-MM-DD HH:mm · <git short hash>'; the dev server shows 'dev'.
-const BUILD = "2026-10-30 13:31 · 168cb2d";
+const BUILD = "2026-10-30 14:01 · 168cb2d";
 
 Object.defineProperty(__exp, "BUILD", { enumerable: true, get: () => BUILD });
 };
