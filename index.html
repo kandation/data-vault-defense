@@ -805,6 +805,13 @@ background:linear-gradient(#2c4570,#2c4570) 4px 4px/72px 104px no-repeat}
 .fold-b{display:flex;flex-direction:column;gap:8px;padding:4px 0 8px}
 .fold-b[hidden]{display:none}
 .modal.solid{background:var(--bg0,#0b1324)}
+.modal.cb .box{max-height:100%;overflow-y:auto;display:flex;flex-direction:column;gap:8px}
+.cb-list{display:flex;flex-direction:column;gap:8px}
+.cb-item{border:2px solid #3c5a8c;padding:8px;display:flex;flex-direction:column;gap:3px;font-size:14px;line-height:1.35}
+.cb-h{display:flex;align-items:center;gap:8px}
+.cb-t{flex:1;display:flex;flex-direction:column}.cb-t b{font-size:16px}.cb-t small{opacity:.8}
+.cb-dp{font-weight:800;white-space:nowrap}
+.cb-r{display:flex;flex-direction:column}.cb-r b{opacity:.85;font-size:12px}
 .modal .box{--skin:var(--ni-navy);width:100%;max-width:440px;padding:12px 14px;display:flex;flex-direction:column;gap:10px;max-height:100%;overflow-y:auto;box-shadow:var(--e3)}
 .modal h2{margin:0;text-align:center;color:var(--cream);text-shadow:0 2px 0 var(--ink)}
 #events{position:absolute;inset:0;z-index:30;pointer-events:none}
@@ -883,6 +890,7 @@ const ONBOARD_CSS = `
 .scrim{position:absolute;inset:0;background:rgba(11,19,36,.4);pointer-events:none;z-index:4}
 .radial{display:block;width:0;height:0}
 .radial .rbtn{position:absolute;width:60px;min-height:60px;height:60px;margin:-30px 0 0 -30px}
+.radial .rbtn.rclose{width:44px;min-height:44px;height:44px;margin:-22px 0 0 -22px}
 .radial .rbtn.skill{width:64px;height:64px;margin:-32px 0 0 -32px}
 .radial .rbtn.retreat.armed{--skin:var(--ni-red);animation:glow .3s steps(2) infinite alternate;width:96px;margin-left:-48px}
 .radial .info{position:absolute;top:30px;--skin:var(--ni-navy);border:4px solid transparent;border-image-source:var(--ni-navy);border-image-slice:var(--ni-slice,4) fill;border-image-width:4px;image-rendering:pixelated}
@@ -1469,7 +1477,7 @@ let runId = '';
 let gate = () => true;
 function setGate(fn) { gate = typeof fn === 'function' ? fn : () => true; if (!gate()) events.length = 0; trace.setGate(gate); }
 
-function reset(id = '') { events.length = 0; runId = String(id); trace.setRun(runId); trace.act('run', { seed: runId }); }
+function reset(id = '') { events.length = 0; runId = String(id); trace.setRun(runId); }
 
 function track(name, data) {
   if (!gate()) return null;
@@ -1502,34 +1510,54 @@ __defs["src/core/trace.js"] = function(__exp, __req, __dyn) {
 // Full play trace (consent group 'telemetry'): every click / tap with WHAT was hit, key presses (names only, never typed text), drag path samples, screen changes,
 // every game action with the simulation clock (deploy / helper / retreat / rotate / skill / redraw / spray / tool), wave and event milestones, pause / speed / auto,
 // frame-rate samples, errors, tab visibility, plus the old telemetry.track() calls.  With the run header (seed, level, mode, build) this is a replay script.
-// Cheap by design: one small object per event in memory, nothing is sent while the player plays; batches (<= 40 KB) go out every 20 s, on hide / leave, and at the end
-// of a run.  Each batch is signed with the install key (src/core/secure_store.js) so the server can tell a real game from forged traffic.  Never throws.
+//
+// Built for free-tier servers and for privacy:
+//   * KEPT ON THE DEVICE while playing (memory; on hide / leave it is written to the sealed localStorage).  Nothing is sent during play.
+//   * SENT ONCE, at the end of a run: compressed, ENCRYPTED with the researcher's public key (src/core/trace_crypto.js), after a random 0-60 s delay so a whole
+//     class finishing together does not hit the server in the same second.  Offline / failed = kept and retried later; older than 7 days = dropped.
+//   * ANONYMOUS: a random id per run (not per player, not per device), coarse screen / language values, no IP (the server cannot see one), no typed text.
+//   * SAMPLED: only a share of the runs (TRACE_SAMPLE) records a trace at all; local development records every run.
+// Each batch is signed with a key derived from the run id, so the server can tell a real game build from forged traffic.  Never throws.
 const { getEndpoint } = __req("src/metrics/config.js");
+const { SECRET } = __req("src/core/secret.js");
+const { hmacSha256, utf8, sign } = __req("src/core/sealed.js");
+const { sealFor } = __req("src/core/trace_crypto.js");
 
-const MAX_Q = 4000, CHUNK = 300, PERSIST_KEY = 'tpdv_trace_q', PERSIST_MAX = 250000, BUILD = 'v1';
+const TRACE_SAMPLE = 0.25;           // share of runs that record a trace (dev hosts and ?trace=1: all)
+const MAX_Q = 8000, CHUNK = 1500, ENV_MAX = 44000, PERSIST_KEY = 'tpdv_trace_q', PERSIST_MAX = 400000, KEEP_MS = 7 * 86400000, BUILD = 'v2';
 let gate = () => false;
+let sampled = true, jitterMax = 60000;
 let Q = [];
-let dropped = 0, seq = 0, runId = '', t0 = 0, simClock = () => null, installed = false, timer = 0;
-const sess = Math.random().toString(16).slice(2, 8);
+let dropped = 0, seq = 0, runId = '', t0 = 0, simClock = () => null, installed = false, sending = null;
+const rid = () => { const a = new Uint8Array(6); try { globalThis.crypto.getRandomValues(a); } catch (e) { for (let i = 0; i < 6; i++) a[i] = Math.floor(Math.random() * 256); } return Array.from(a, (b) => b.toString(16).padStart(2, '0')).join(''); };
 const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
-const secure = () => { try { return window.__tpdvSecure || null; } catch (e) { return null; } };
+const ls = () => { try { return typeof localStorage !== 'undefined' ? localStorage : null; } catch (e) { return null; } };
+const isDevHost = () => { try { if (typeof location === 'undefined') return true; const h = location.hostname; return location.protocol === 'file:' || h === 'localhost' || h === '127.0.0.1' || h.endsWith('.localhost') || h.endsWith('.test') || /[?&]trace=1(&|$)/.test(location.search); } catch (e) { return false; } };
 
 function setGate(fn) { gate = typeof fn === 'function' ? fn : () => false; if (!gate()) { Q = []; } }
 function setSimClock(fn) { simClock = typeof fn === 'function' ? fn : () => null; }
-function setRun(id) { runId = String(id || ''); }
+function setJitter(ms) { jitterMax = Math.max(0, ms | 0); }
+/** a run begins: a NEW random run id (nothing links two runs), and the dice decide whether this run records a trace */
+function setRun(seed, sample = TRACE_SAMPLE) {
+  runId = rid(); seq = 0; t0 = 0;
+  sampled = isDevHost() || Math.random() < sample;
+  if (!sampled) Q = [];
+  act('run', { seed: String(seed || '') });
+}
+const runInfo = () => ({ run: runId, sampled });
 const pending = () => Q.length;
+const open = () => sampled && gate();
 
 /** one event: k = kind, d = small flat object */
 function act(k, d) {
   try {
-    if (!gate()) return;
+    if (!open()) return;
     if (!t0) t0 = now();
     const e = { t: Math.round(now() - t0), k };
     const s = simClock(); if (s != null) e.s = Math.round(s * 100) / 100;
     if (d) for (const key in d) { const v = d[key]; if (v !== undefined) e[key] = v; }
     if (Q.length >= MAX_Q) { Q.shift(); dropped++; }
     Q.push(e);
-    if (Q.length >= 600) flush();
   } catch (err) { /* never throws */ }
 }
 
@@ -1562,48 +1590,79 @@ function describe(el) {
   } catch (e) { return ''; }
 }
 
-function build(evs) {
-  const S = secure();
-  const P = JSON.stringify({ v: 1, b: BUILD, sess, run: runId, seq: ++seq, t: Date.now(), drop: dropped, evs });
-  dropped = 0;
-  return JSON.stringify({ tr: P, sig: S ? S.sign(P) : '', salt: S ? S.salt : '', inst: S ? S.installId : '' });
+/* ---------------- on-device queue (sealed localStorage) ---------------- */
+function readSaved() {
+  try { const s = ls(); const q = s ? JSON.parse(s.getItem(PERSIST_KEY) || '[]') : []; return Array.isArray(q) ? q.filter((b) => b && b.at > Date.now() - KEEP_MS) : []; } catch (e) { return []; }
 }
-
-function persist(bodies) {
+function writeSaved(q) {
   try {
-    let q = []; try { q = JSON.parse(localStorage.getItem(PERSIST_KEY) || '[]'); } catch (e) { q = []; }
-    q.push(...bodies);
-    let size = q.reduce((a, b) => a + b.length, 0);
-    while (q.length && size > PERSIST_MAX) size -= q.shift().length;
-    localStorage.setItem(PERSIST_KEY, JSON.stringify(q));
+    const s = ls(); if (!s) return;
+    let size = JSON.stringify(q).length;
+    while (q.length && size > PERSIST_MAX) { size -= JSON.stringify(q.shift()).length; }
+    if (q.length) s.setItem(PERSIST_KEY, JSON.stringify(q)); else s.removeItem(PERSIST_KEY);
   } catch (e) { /* storage full / blocked */ }
 }
-
-function post(url, body, beacon) {
-  try {
-    if (beacon && navigator.sendBeacon) { if (navigator.sendBeacon(url, new Blob([body], { type: 'text/plain' }))) return true; }
-    fetch(url, { method: 'POST', mode: 'no-cors', keepalive: body.length < 60000, headers: { 'Content-Type': 'text/plain' }, body }).catch(() => {});
-    return true;
-  } catch (e) { return false; }
+/** keep what is in memory on the device (page hidden / leaving / no network) */
+function save() {
+  if (!Q.length) return;
+  const q = readSaved(); q.push({ at: Date.now(), run: runId, evs: Q.splice(0) });
+  writeSaved(q);
 }
 
-/** send what is waiting (and anything left from an earlier visit).  beacon = page is going away */
-function flush(beacon = false) {
+/* ---------------- sending ---------------- */
+function post(url, body) {
+  try { fetch(url, { method: 'POST', mode: 'no-cors', keepalive: body.length < 60000, headers: { 'Content-Type': 'text/plain' }, body }).catch(() => {}); return true; } catch (e) { return false; }
+}
+async function envelopes(run, evs) { // one or more envelopes, each small enough for a sheet cell
+  const env = await sealFor({ run, evs });
+  if (env.length <= ENV_MAX || evs.length < 2) return [{ env, n: evs.length }];
+  const h = evs.length >> 1;
+  return (await envelopes(run, evs.slice(0, h))).concat(await envelopes(run, evs.slice(h)));
+}
+/** encrypt and send everything that is waiting (this run + earlier visits).  Resolves true when requests were made. */
+async function sendNow() {
+  if (sending) return sending;
+  sending = (async () => {
+    try {
+      if (!gate()) return false;
+      const url = getEndpoint();
+      const batches = readSaved();
+      if (Q.length) batches.push({ at: Date.now(), run: runId, evs: Q.splice(0), live: 1 });
+      if (!batches.length) return false;
+      writeSaved([]);
+      const offline = !url || (typeof navigator !== 'undefined' && navigator.onLine === false);
+      const keep = [];
+      for (const b of batches) {
+        if (offline) { keep.push(b); continue; }
+        try {
+          for (let i = 0; i < b.evs.length; i += CHUNK) {
+            const part = b.evs.slice(i, i + CHUNK);
+            for (const { env, n } of await envelopes(b.run, part)) {
+              const P = JSON.stringify({ v: 2, b: BUILD, run: b.run, seq: ++seq, n, drop: dropped, env });
+              dropped = 0;
+              post(url, JSON.stringify({ tr: P, sig: sign(hmacSha256(utf8(String(SECRET)), 'trc|' + b.run), P) }));
+            }
+          }
+        } catch (e) { keep.push(b); }
+      }
+      if (keep.length) writeSaved(readSaved().concat(keep));
+      return !offline;
+    } catch (e) { return false; } finally { sending = null; }
+  })();
+  return sending;
+}
+/** end of a run (or the connection came back): send after a random delay (0 .. jitter) so many players finishing together do not arrive together */
+function flush() {
   try {
-    if (!gate()) return false;
-    const url = getEndpoint();
-    const bodies = [];
-    while (Q.length) bodies.push(build(Q.splice(0, CHUNK)));
-    let old = []; try { old = JSON.parse(localStorage.getItem(PERSIST_KEY) || '[]'); } catch (e) { old = []; }
-    if (old.length) { try { localStorage.removeItem(PERSIST_KEY); } catch (e) { /* ignore */ } bodies.unshift(...old); }
-    if (!bodies.length) return false;
-    if (!url || (typeof navigator !== 'undefined' && navigator.onLine === false)) { persist(bodies); return false; }
-    for (const b of bodies) post(url, b, beacon);
+    if (!open()) return false;
+    const wait = jitterMax && !isDevHost() ? Math.floor(Math.random() * jitterMax) : 0;
+    if (wait) setTimeout(() => { sendNow(); }, wait); else sendNow();
     return true;
   } catch (e) { return false; }
 }
 
 const rel = (v, max) => Math.max(0, Math.min(1000, Math.round((v / (max || 1)) * 1000)));
+const bucket = (v, step) => Math.round((v || 0) / step) * step;
 
 /** the passive listeners (clicks, keys, drags, visibility, errors, fps).  Call once; harmless when the gate is closed. */
 function install(win = window, perf = null) {
@@ -1621,46 +1680,50 @@ function install(win = window, perf = null) {
     act('key', { key: typing && e.key.length === 1 ? '*' : String(e.key).slice(0, 12), el: describe(e.target) });
   }, true);
   win.addEventListener('wheel', () => { const n = now(); if (n - lastMv < 500) return; lastMv = n; act('wheel'); }, { capture: true, passive: true });
-  win.addEventListener('resize', () => act('resize', { w: win.innerWidth, h: win.innerHeight }));
+  win.addEventListener('resize', () => act('resize', { w: bucket(win.innerWidth, 50), h: bucket(win.innerHeight, 50) }));
   win.addEventListener('online', () => { act('net', { on: 1 }); flush(); });
   win.addEventListener('offline', () => act('net', { on: 0 }));
   win.addEventListener('blur', () => act('focus', { on: 0 }));
   win.addEventListener('focus', () => act('focus', { on: 1 }));
   win.addEventListener('error', (e) => act('err', { m: String(e.message || '').slice(0, 160), at: String(e.filename || '').split('/').pop() + ':' + (e.lineno || 0) }));
   win.addEventListener('unhandledrejection', (e) => act('err', { m: String((e.reason && e.reason.message) || e.reason || '').slice(0, 160), rej: 1 }));
-  doc.addEventListener('visibilitychange', () => { act('vis', { hidden: doc.hidden ? 1 : 0 }); if (doc.hidden) flush(true); });
-  win.addEventListener('pagehide', () => { act('leave'); flush(true); });
-  // session header: what screen this is (no ids, no user agent string; classes only)
+  // nothing is sent while playing or when the page goes away: it is kept on the device and goes out at the end of a run
+  doc.addEventListener('visibilitychange', () => { act('vis', { hidden: doc.hidden ? 1 : 0 }); if (doc.hidden) save(); });
+  win.addEventListener('pagehide', () => { act('leave'); save(); });
+  // session header: coarse on purpose (screen rounded to 50 px, language without region, no CPU / memory figures): a rare combination could point at a person
   const touch = 'ontouchstart' in win || (win.navigator && win.navigator.maxTouchPoints > 0);
-  act('hello', { w: win.innerWidth, h: win.innerHeight, dpr: win.devicePixelRatio || 1, touch: touch ? 1 : 0, lang: (win.navigator && win.navigator.language) || '', b: BUILD,
-    mem: (win.navigator && win.navigator.deviceMemory) || 0, cpu: (win.navigator && win.navigator.hardwareConcurrency) || 0 });
+  act('hello', { w: bucket(win.innerWidth, 50), h: bucket(win.innerHeight, 50), dpr: Math.round((win.devicePixelRatio || 1) * 2) / 2, touch: touch ? 1 : 0, lang: String((win.navigator && win.navigator.language) || '').slice(0, 2), b: BUILD });
   // 5 s frame-rate samples from the existing governor (no extra animation frame loop)
-  if (perf) setInterval(() => { if (doc.hidden || !gate()) return; act('perf', { fps: Math.round(perf.fps || 0), p95: Math.round((perf.p95 || 0) * 10) / 10, tier: perf.tier, heap: Math.round(perf.heapMB || 0) }); }, 5000);
-  timer = setInterval(() => { if (!doc.hidden) flush(); }, 20000);
+  if (perf) setInterval(() => { if (doc.hidden || !open()) return; act('perf', { fps: Math.round(perf.fps || 0), p95: Math.round((perf.p95 || 0) * 10) / 10, tier: perf.tier }); }, 5000);
+  // what an earlier visit left on the device goes out a little after start (random delay), if the player allows it
+  setTimeout(() => { if (open() && readSaved().length) flush(); }, 8000);
 }
-function uninstallTimers() { if (timer) { clearInterval(timer); timer = 0; } }
-const _state = () => ({ q: Q.length, dropped, seq, sess });
+const _state = () => ({ q: Q.length, dropped, seq, run: runId, sampled, saved: readSaved().length });
 
 Object.defineProperty(__exp, "setGate", { enumerable: true, get: () => setGate });
 Object.defineProperty(__exp, "setSimClock", { enumerable: true, get: () => setSimClock });
+Object.defineProperty(__exp, "setJitter", { enumerable: true, get: () => setJitter });
 Object.defineProperty(__exp, "setRun", { enumerable: true, get: () => setRun });
 Object.defineProperty(__exp, "act", { enumerable: true, get: () => act });
 Object.defineProperty(__exp, "simEvent", { enumerable: true, get: () => simEvent });
 Object.defineProperty(__exp, "describe", { enumerable: true, get: () => describe });
+Object.defineProperty(__exp, "save", { enumerable: true, get: () => save });
+Object.defineProperty(__exp, "sendNow", { enumerable: true, get: () => sendNow });
 Object.defineProperty(__exp, "flush", { enumerable: true, get: () => flush });
 Object.defineProperty(__exp, "install", { enumerable: true, get: () => install });
-Object.defineProperty(__exp, "uninstallTimers", { enumerable: true, get: () => uninstallTimers });
+Object.defineProperty(__exp, "TRACE_SAMPLE", { enumerable: true, get: () => TRACE_SAMPLE });
+Object.defineProperty(__exp, "runInfo", { enumerable: true, get: () => runInfo });
 Object.defineProperty(__exp, "pending", { enumerable: true, get: () => pending });
 Object.defineProperty(__exp, "_state", { enumerable: true, get: () => _state });
 };
 __defs["src/metrics/config.js"] = function(__exp, __req, __dyn) {
 // Where run reports are sent.  Resolution order:
-//   1. ?endpoint=<url> on the page URL (only https://script.google.com/... , https://script.googleusercontent.com/... or localhost / 127.0.0.1)
+//   1. ?endpoint=<url> on the page URL (only https://script.google.com/... , https://script.googleusercontent.com/... , https://*.workers.dev or localhost / 127.0.0.1)
 //   2. window.TPDV_ENDPOINT   (set by the host page / a <script> before the game)
 //   3. CFG.ENDPOINT below     (edit once after deploying apps-script/Code.gs, or: node tools/build.mjs --endpoint <url>)
 // Empty = no endpoint: the long backup code stays visible and can be given to the admin.
 const CFG = {
-  ENDPOINT: "https://script.google.com/macros/s/AKfycbweP87qVZ5b3O4OaM9fS7g3OmgiN3RAxQroZIIB-wiO-FDSTv9n2AkNnCq9HFuPH0VV/exec", /*ENDPOINT*/
+  ENDPOINT: "https://tpdv-results.kandation.workers.dev", /*ENDPOINT*/
   FORM_URL: 'https://forms.gle/Td35cbx9Xfk9ucvr8', // the Google Form the ref code is entered into (level-1 / Pre / Post end popup: 'เปิด Google Form'); empty = the popup shows copy-only
 
 };
@@ -1676,7 +1739,7 @@ function getFormUrl() {
 function isAllowedParamEndpoint(u) {
   try {
     const x = new URL(u);
-    if (x.protocol === 'https:' && (x.hostname === 'script.google.com' || x.hostname === 'script.googleusercontent.com')) return true;
+    if (x.protocol === 'https:' && (x.hostname === 'script.google.com' || x.hostname === 'script.googleusercontent.com' || x.hostname.endsWith('.workers.dev'))) return true;
     return (x.protocol === 'http:' || x.protocol === 'https:') && (x.hostname === 'localhost' || x.hostname === '127.0.0.1' || x.hostname === '[::1]');
   } catch (e) { return false; }
 }
@@ -1698,6 +1761,224 @@ Object.defineProperty(__exp, "getFormUrl", { enumerable: true, get: () => getFor
 Object.defineProperty(__exp, "isAllowedParamEndpoint", { enumerable: true, get: () => isAllowedParamEndpoint });
 Object.defineProperty(__exp, "getEndpoint", { enumerable: true, get: () => getEndpoint });
 Object.defineProperty(__exp, "CFG", { enumerable: true, get: () => CFG });
+};
+__defs["src/core/secret.js"] = function(__exp, __req, __dyn) {
+// The game <-> server shared secret.  `node tools/build.mjs` replaces the value with the one in tools/.secret (git-ignored, made on the first build;
+// the same text goes into the Apps Script property TRACE_KEY, see apps-script/README.md).  The checked-in value is only for local development.
+const SECRET = "E3bXY6p0YEQUw8w1Sl_Y1G71YzC5dixl";
+
+Object.defineProperty(__exp, "SECRET", { enumerable: true, get: () => SECRET });
+};
+__defs["src/core/sealed.js"] = function(__exp, __req, __dyn) {
+// Synchronous authenticated encryption for everything this game keeps on the device (and the signature the server checks).
+//   sha256 / hmacSha256 (RFC 6234 / 2104), chacha20 (RFC 8439), seal / open = ChaCha20 + HMAC-SHA256 (encrypt-then-MAC, 128-bit tag).
+// Sync on purpose: the game reads and writes localStorage synchronously in ~20 places; WebCrypto is async-only.
+// What it gives: nobody can read OR edit a stored value without the key; a flipped bit = rejected.  What no client-side scheme can give: the key has
+// to sit inside the game for the game to read its own save, so a determined owner of the device who reverse-engineers the bundle can get it.  The server
+// therefore never trusts the stored values: it re-derives the same key (src/core/secure_store.js 'sign') and rejects what does not verify.
+const K = new Uint32Array([
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+]);
+const rotr = (x, n) => (x >>> n) | (x << (32 - n));
+
+function utf8(s) { return typeof s === 'string' ? new TextEncoder().encode(s) : s; }
+
+function sha256(msg) {
+  const m = utf8(msg);
+  const h = new Uint32Array([0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]);
+  const n = m.length, padLen = ((n + 9 + 63) >> 6) << 6;
+  const b = new Uint8Array(padLen);
+  b.set(m); b[n] = 0x80;
+  const dv = new DataView(b.buffer);
+  dv.setUint32(padLen - 8, Math.floor((n * 8) / 4294967296), false);
+  dv.setUint32(padLen - 4, (n * 8) >>> 0, false);
+  const w = new Uint32Array(64);
+  for (let o = 0; o < padLen; o += 64) {
+    for (let i = 0; i < 16; i++) w[i] = dv.getUint32(o + i * 4, false);
+    for (let i = 16; i < 64; i++) {
+      const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3), s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) | 0;
+    }
+    let a = h[0], bb = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+    for (let i = 0; i < 64; i++) {
+      const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25), ch = (e & f) ^ (~e & g), t1 = (hh + S1 + ch + K[i] + w[i]) | 0;
+      const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22), mj = (a & bb) ^ (a & c) ^ (bb & c), t2 = (S0 + mj) | 0;
+      hh = g; g = f; f = e; e = (d + t1) | 0; d = c; c = bb; bb = a; a = (t1 + t2) | 0;
+    }
+    h[0] += a; h[1] += bb; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+  }
+  const out = new Uint8Array(32), ov = new DataView(out.buffer);
+  for (let i = 0; i < 8; i++) ov.setUint32(i * 4, h[i], false);
+  return out;
+}
+
+function concat(...parts) {
+  let n = 0; for (const p of parts) n += p.length;
+  const o = new Uint8Array(n); let k = 0;
+  for (const p of parts) { o.set(p, k); k += p.length; }
+  return o;
+}
+
+function hmacSha256(key, msg) {
+  let k = utf8(key);
+  if (k.length > 64) k = sha256(k);
+  const ip = new Uint8Array(64).fill(0x36), op = new Uint8Array(64).fill(0x5c);
+  for (let i = 0; i < k.length; i++) { ip[i] ^= k[i]; op[i] ^= k[i]; }
+  return sha256(concat(op, sha256(concat(ip, utf8(msg)))));
+}
+
+/** ChaCha20 (RFC 8439): key 32 bytes, nonce 12 bytes, 32-bit block counter */
+function chacha20(key, nonce, data, counter = 1) {
+  const st = new Uint32Array(16), x = new Uint32Array(16), out = new Uint8Array(data.length);
+  const kv = new DataView(key.buffer, key.byteOffset, 32), nv = new DataView(nonce.buffer, nonce.byteOffset, 12);
+  st[0] = 0x61707865; st[1] = 0x3320646e; st[2] = 0x79622d32; st[3] = 0x6b206574;
+  for (let i = 0; i < 8; i++) st[4 + i] = kv.getUint32(i * 4, true);
+  for (let i = 0; i < 3; i++) st[13 + i] = nv.getUint32(i * 4, true);
+  const qr = (a, b, c, d) => {
+    x[a] += x[b]; x[d] = ((x[d] ^ x[a]) << 16) | ((x[d] ^ x[a]) >>> 16);
+    x[c] += x[d]; x[b] = ((x[b] ^ x[c]) << 12) | ((x[b] ^ x[c]) >>> 20);
+    x[a] += x[b]; x[d] = ((x[d] ^ x[a]) << 8) | ((x[d] ^ x[a]) >>> 24);
+    x[c] += x[d]; x[b] = ((x[b] ^ x[c]) << 7) | ((x[b] ^ x[c]) >>> 25);
+  };
+  for (let off = 0; off < data.length; off += 64, counter++) {
+    st[12] = counter >>> 0;
+    x.set(st);
+    for (let r = 0; r < 10; r++) { qr(0, 4, 8, 12); qr(1, 5, 9, 13); qr(2, 6, 10, 14); qr(3, 7, 11, 15); qr(0, 5, 10, 15); qr(1, 6, 11, 12); qr(2, 7, 8, 13); qr(3, 4, 9, 14); }
+    const end = Math.min(64, data.length - off);
+    for (let i = 0; i < end; i++) { const word = (x[i >> 2] + st[i >> 2]) >>> 0; out[off + i] = data[off + i] ^ ((word >>> ((i & 3) * 8)) & 255); }
+  }
+  return out;
+}
+
+function randomBytes(n) {
+  const a = new Uint8Array(n);
+  try { globalThis.crypto.getRandomValues(a); } catch (e) { for (let i = 0; i < n; i++) a[i] = Math.floor(Math.random() * 256); }
+  return a;
+}
+
+const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+function b64(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i += 3) {
+    const n = (bytes[i] << 16) | ((bytes[i + 1] || 0) << 8) | (bytes[i + 2] || 0);
+    s += B64[(n >> 18) & 63] + B64[(n >> 12) & 63] + (i + 1 < bytes.length ? B64[(n >> 6) & 63] : '') + (i + 2 < bytes.length ? B64[n & 63] : '');
+  }
+  return s;
+}
+function unb64(s) {
+  const out = [];
+  let acc = 0, bits = 0;
+  for (const ch of s) {
+    const v = B64.indexOf(ch);
+    if (v < 0) return null;
+    acc = (acc << 6) | v; bits += 6;
+    if (bits >= 8) { bits -= 8; out.push((acc >> bits) & 255); acc &= (1 << bits) - 1; }
+  }
+  return Uint8Array.from(out);
+}
+const hex = (b) => Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
+
+const ctEq = (a, b) => { if (a.length !== b.length) return false; let d = 0; for (let i = 0; i < a.length; i++) d |= a[i] ^ b[i]; return d === 0; };
+
+/** key (32 bytes) + context string (bound into the tag: a value cannot be moved under another name) -> base64url text */
+function seal(key, context, plaintext, nonce = randomBytes(12)) {
+  const ek = hmacSha256(key, 'enc'), mk = hmacSha256(key, 'mac');
+  const ct = chacha20(ek, nonce, utf8(plaintext));
+  const tag = hmacSha256(mk, concat(utf8(context + '\0'), nonce, ct)).subarray(0, 16);
+  return b64(concat(nonce, ct, tag));
+}
+/** -> plaintext string, or null when the text was altered / made for another key or name */
+function open(key, context, text) {
+  const raw = unb64(String(text));
+  if (!raw || raw.length < 28) return null;
+  const nonce = raw.subarray(0, 12), ct = raw.subarray(12, raw.length - 16), tag = raw.subarray(raw.length - 16);
+  const ek = hmacSha256(key, 'enc'), mk = hmacSha256(key, 'mac');
+  if (!ctEq(hmacSha256(mk, concat(utf8(context + '\0'), nonce, ct)).subarray(0, 16), tag)) return null;
+  try { return new TextDecoder().decode(chacha20(ek, nonce, ct)); } catch (e) { return null; }
+}
+/** detached signature (hex, 128 bit) of a text under a key: what the server re-computes */
+const sign = (key, text) => hex(hmacSha256(key, text).subarray(0, 16));
+
+Object.defineProperty(__exp, "utf8", { enumerable: true, get: () => utf8 });
+Object.defineProperty(__exp, "sha256", { enumerable: true, get: () => sha256 });
+Object.defineProperty(__exp, "concat", { enumerable: true, get: () => concat });
+Object.defineProperty(__exp, "hmacSha256", { enumerable: true, get: () => hmacSha256 });
+Object.defineProperty(__exp, "chacha20", { enumerable: true, get: () => chacha20 });
+Object.defineProperty(__exp, "randomBytes", { enumerable: true, get: () => randomBytes });
+Object.defineProperty(__exp, "b64", { enumerable: true, get: () => b64 });
+Object.defineProperty(__exp, "unb64", { enumerable: true, get: () => unb64 });
+Object.defineProperty(__exp, "seal", { enumerable: true, get: () => seal });
+Object.defineProperty(__exp, "open", { enumerable: true, get: () => open });
+Object.defineProperty(__exp, "hex", { enumerable: true, get: () => hex });
+Object.defineProperty(__exp, "sign", { enumerable: true, get: () => sign });
+};
+__defs["src/core/trace_crypto.js"] = function(__exp, __req, __dyn) {
+// Trace envelopes: a play trace is compressed and sealed with the RESEARCHER'S PUBLIC KEY before it leaves the device (ECDH P-256 + HKDF + AES-GCM-256, WebCrypto).
+// Whoever holds the sheet / the server / a stolen copy sees only 'v1.<ephemeral key>.<iv>.<ciphertext>': it opens only with the private key, which stays offline with
+// the researcher (tools/make_trace_keys.mjs makes the pair, tools/decrypt_trace.mjs opens an export).  A fresh ephemeral key per envelope: no two look alike.
+const { TRACE_PUB } = __req("src/core/trace_pub.js");
+const { b64, unb64 } = __req("src/core/sealed.js");
+
+const INFO = new TextEncoder().encode('tpdv-trace-v1');
+const subtle = () => globalThis.crypto && globalThis.crypto.subtle;
+
+async function gzip(bytes) {
+  if (typeof CompressionStream !== 'function') return { z: 0, data: bytes };
+  const cs = new CompressionStream('gzip'), w = cs.writable.getWriter();
+  w.write(bytes); w.close();
+  return { z: 1, data: new Uint8Array(await new Response(cs.readable).arrayBuffer()) };
+}
+async function gunzip(bytes) {
+  const ds = new DecompressionStream('gzip'), w = ds.writable.getWriter();
+  w.write(bytes); w.close();
+  return new Uint8Array(await new Response(ds.readable).arrayBuffer());
+}
+async function aesKey(shared, salt, usage) {
+  const s = subtle();
+  const base = await s.importKey('raw', shared, 'HKDF', false, ['deriveKey']);
+  return s.deriveKey({ name: 'HKDF', hash: 'SHA-256', salt, info: INFO }, base, { name: 'AES-GCM', length: 256 }, false, usage);
+}
+
+/** value (any JSON) -> 'v1.<z>.<eph>.<iv>.<ct>' (base64url parts); pub = a P-256 public JWK (default: the one baked in the build) */
+async function sealFor(value, pub = TRACE_PUB) {
+  const s = subtle();
+  const eph = await s.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
+  const rec = await s.importKey('jwk', pub, { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+  const shared = new Uint8Array(await s.deriveBits({ name: 'ECDH', public: rec }, eph.privateKey, 256));
+  const ephRaw = new Uint8Array(await s.exportKey('raw', eph.publicKey));
+  const key = await aesKey(shared, ephRaw, ['encrypt']);
+  const iv = globalThis.crypto.getRandomValues(new Uint8Array(12));
+  const { z, data } = await gzip(new TextEncoder().encode(JSON.stringify(value)));
+  const ct = new Uint8Array(await s.encrypt({ name: 'AES-GCM', iv }, key, data));
+  return ['v1', z, b64(ephRaw), b64(iv), b64(ct)].join('.');
+}
+
+/** the researcher's side (Node / a browser tool): envelope + private JWK -> the value */
+async function openWith(envelope, privJwk) {
+  const s = subtle();
+  const [v, z, e, i, c] = String(envelope).split('.');
+  if (v !== 'v1') throw new Error('unknown envelope');
+  const priv = await s.importKey('jwk', privJwk, { name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
+  const ephRaw = unb64(e), eph = await s.importKey('raw', ephRaw, { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+  const shared = new Uint8Array(await s.deriveBits({ name: 'ECDH', public: eph }, priv, 256));
+  const key = await aesKey(shared, ephRaw, ['decrypt']);
+  let data = new Uint8Array(await s.decrypt({ name: 'AES-GCM', iv: unb64(i) }, key, unb64(c)));
+  if (z === '1') data = await gunzip(data);
+  return JSON.parse(new TextDecoder().decode(data));
+}
+
+Object.defineProperty(__exp, "gunzip", { enumerable: true, get: () => gunzip });
+Object.defineProperty(__exp, "sealFor", { enumerable: true, get: () => sealFor });
+Object.defineProperty(__exp, "openWith", { enumerable: true, get: () => openWith });
+};
+__defs["src/core/trace_pub.js"] = function(__exp, __req, __dyn) {
+// The researcher's PUBLIC key for trace envelopes (made by tools/make_trace_keys.mjs).  Public by design: it can only lock, not open.
+const TRACE_PUB = {"kty":"EC","crv":"P-256","x":"aiS3l-SSQ9ZQix8K7czXh9KkuPQKjUa_-SdiWKIUjXo","y":"k9DGfcgnxKdzR1FbbHW3Hz5bNd1AwQrcsCKDC69TyPg"};
+
+Object.defineProperty(__exp, "TRACE_PUB", { enumerable: true, get: () => TRACE_PUB });
 };
 __defs["src/core/rng.js"] = function(__exp, __req, __dyn) {
 // Seeded RNG (mulberry32) + helpers. Pure, no DOM.
@@ -17193,7 +17474,7 @@ __defs["src/td/autoplay.js"] = function(__exp, __req, __dyn) {
 // Policy: pick the card whose counter matches what is on the field / about to spawn (wave plan lookahead), place it where
 // it adds the most NEW path coverage (spreads along the route), blockers near 2/3 of the route, never retreat, never
 // hoard DP (spends on helpers when capped), use helpers only when they matter.  Skills are fired by sim.autoSkill.
-const { validTiles, canPlay, deployCard, playHelper, playerCost, retreatOp } = __req("src/td/combat.js");
+const { validTiles, canPlay, deployCard, playHelper, playerCost, retreatOp, redrawCard } = __req("src/td/combat.js");
 const { autoFace, rangeTiles } = __req("src/td/grid.js");
 const { cardDef, isOperator, SIM } = __req("src/td/units.js");
 
@@ -17358,7 +17639,46 @@ function usbRescue(sim, R) {
   return null;
 }
 
-function tryHelper(sim, threats) {
+// Smart Auto only (R.smart: 2 = level 1, full; 1 = later levels, dead cards only): swap a hand card that cannot help.
+//   dead card  = a used 'backup' (never playable again), or a hand with no operator at all while the field has room
+//   useless    = (smart 2) enemies are on the field, no operator in hand counters any of them, and the card is a duplicate of one already fielded
+// costs 2 DP (or a free redraw), only with enough DP left afterwards to still place a unit; at most once per cooldown.
+function maybeRedraw(sim, st, threats, counts, R) {
+  const smart = R.smart | 0;
+  if (!smart || sim.t - (st.rdT ?? -99) < (smart >= 2 ? 3 : 9)) return false;
+  const free = sim.freeRedraws > 0;
+  if (!free && sim.dp < 2 + (smart >= 2 ? 3 : 5)) return false;
+  const hand = sim.deck.hand;
+  if (!sim.deck.pile.length) return false;
+  let slot = hand.findIndex((c) => c && c.key === 'backup' && sim.backupUsed);
+  const room = sim.ops.length < (R.maxOps ? Math.min(SIM.deployLimit, R.maxOps) : SIM.deployLimit);
+  if (slot < 0 && room) {
+    const ops = hand.map((c, i) => (c && isOperator(c.key) ? i : -1)).filter((i) => i >= 0);
+    if (!ops.length) { // only helpers in hand: swap one out
+      const i = hand.findIndex((c) => c && !c.golden && !c.free);
+      if (i >= 0 && sim.dp >= 5) slot = i;
+    } else if (smart >= 2 && sim.enemies.some((e) => !e.dead)) {
+      const typed = Object.keys(threats).filter((t) => COUNTERS[t]);
+      const hits = (key) => typed.some((t) => COUNTERS[t].includes(key));
+      if (typed.length && !ops.some((i) => hits(hand[i].key))) {
+        let worst = -1, ws = 1e9;
+        for (const i of ops) {
+          const c = hand[i];
+          if (c.golden || c.free || (!counts[c.key] && sim.ops.length)) continue; // keep a card that adds a new type
+          const sc = scoreCard(sim, c, threats, counts, R);
+          if (sc < ws) { ws = sc; worst = i; }
+        }
+        if (worst >= 0) slot = worst;
+      }
+    }
+  }
+  if (slot < 0) return false;
+  st.rdT = sim.t;
+  if (redrawCard(sim, slot)) { st.redraws = (st.redraws || 0) + 1; sim.stats.autoRedraws = st.redraws; return true; }
+  return false;
+}
+
+function tryHelper(sim, threats, R) {
   const hand = sim.deck.hand;
   const alive = sim.enemies.filter((e) => !e.dead);
   for (let slot = 0; slot < hand.length; slot++) {
@@ -17368,8 +17688,9 @@ function tryHelper(sim, threats) {
     const ai = (threats.ghost || 0) + (threats.meetbot || 0) + (threats.blob || 0) > 0 && alive.some((e) => e.type === 'ghost' || e.type === 'meetbot' || e.type === 'blob');
     const capped = sim.dp >= sim.dpCap - 2;
     let use = false;
-    if (c.key === 'training') use = (hidden && alive.length >= 2) || (capped && alive.length >= 1);
-    else if (c.key === 'policy') use = ai || (capped && alive.length >= 2);
+    const smart = R && R.smart >= 2;
+    if (c.key === 'training') use = (hidden && alive.length >= 2) || (capped && alive.length >= 1) || (smart && ((threats.phish || 0) >= 3 || alive.some((e) => e.type === 'meetbot')));
+    else if (c.key === 'policy') use = ai || (capped && alive.length >= 2) || (smart && alive.some((e) => e.type === 'ghost'));
     else if (c.key === 'backup') use = sim.vaultHp <= sim.vaultMax - 6 || sim.ops.some((o) => sim.t < o.encryptedUntil);
     if (use) { const r = playHelper(sim, slot); if (r.ok) return true; }
   }
@@ -17387,6 +17708,7 @@ function autoStep(sim, st, dt) {
   const counts = {};
   for (const o of sim.ops) counts[o.key] = (counts[o.key] || 0) + 1;
   { const u = usbRescue(sim, R); if (u) return u; }
+  if (R && R.smart && maybeRedraw(sim, st, threats, counts, R)) return 'redraw';
   if (sim.ops.length < (R ? Math.min(SIM.deployLimit, R.maxOps) : SIM.deployLimit)) {
     const hand = sim.deck.hand;
     let pick = -1, ps = -1e9;
@@ -17406,7 +17728,7 @@ function autoStep(sim, st, dt) {
       }
     }
   }
-  if ((!R || R.helpers) && tryHelper(sim, threats)) { st.helpers++; return 'helper'; }
+  if ((!R || R.helpers) && tryHelper(sim, threats, R)) { st.helpers++; return 'helper'; }
   if (R && R.relocate && relocate(sim, st)) return 'relocate';
   return null;
 }
@@ -20453,7 +20775,7 @@ function autoRules(level, up = NO_UP) {
   const s5 = Math.min(5, stars); // abilities are those of at most 5 stars
   const sees = !!up.sees;
   return {
-    level: L, stars, base, cap: starCap(L), delay: delayOf(stars), react: REACT[stars],
+    level: L, stars, base, cap: starCap(L), delay: L >= 2 && stars > 5 ? (delayOf(5) + delayOf(stars)) / 2 : delayOf(stars), react: REACT[stars],
     extra: stars - base, // stars that come from the upgrade (shown green)
     useSkill: s5 >= 4,
     relocate: s5 >= 5,
@@ -20462,6 +20784,8 @@ function autoRules(level, up = NO_UP) {
     seesFlying: s5 >= 3 || sees,
     seesSpecial: s5 >= 2 || sees,
     helpers: s5 >= 3,
+    // judgement (autoplay.js maybeRedraw / helper timing): level 1 is the full-brain Auto, levels 2-3 only swap dead cards, level 4+ and 2 stars and below not at all
+    smart: s5 < 3 || L > 3 ? 0 : L === 1 ? 2 : 1,
     maxOps: s5 >= 4 ? 6 : s5 === 3 ? 5 : 4, // how many units it looks after at once (the field limit is 6)
     // radio users at level >= 7 still react 0.5 s later to special enemies
     specialDelay: sees && L >= 7 ? 0.5 : 0,
@@ -22429,6 +22753,7 @@ __defs["src/ui/hud.js"] = function(__exp, __req, __dyn) {
 const { h, clear, spriteEl, iconEl, emojiFor, fmtTime, emitUi } = __req("src/ui/dom.js");
 const { readingTimeMs, readingOpts, createReadTimer } = __req("src/ui/reading.js");
 const { createField } = __req("src/ui/field.js");
+const { cardBookContent } = __req("src/ui/cardbook.js");
 const { pauseSaveSection, exitDialog } = __req("src/ui/codes_ui.js");
 const {
   deployCard, playHelper, redrawCard, validTiles, validTile, useSkill, rotateOp, retreatOp, canPlay, recommendTile, opAt, opById, upcomingSpawns, playerCost,
@@ -22698,7 +23023,7 @@ function createHud({ sprites, settings, audio, params = {}, hooks = {} }) {
         return;
       }
     }
-    if (op) { selectOp(op); return; }
+    if (op) { if (H.sel.op === op.id && radial) clearSelection(); else selectOp(op); return; }
     const e = field.pickEnemy(sim, t.px, t.py);
     if (e) { H.sel.enemy = e.id; removeRadial(); H.sel.op = null; showEnemyTip(e); return; }
     clearSelection();
@@ -22736,8 +23061,9 @@ function createHud({ sprites, settings, audio, params = {}, hooks = {} }) {
     const rotBtn = h('button', { class: 'rbtn', 'data-coach': 'rot', 'aria-label': 'หมุน 90 องศา', onClick: () => { rotateOp(sim, op.id); audio.play('tap'); } }, h('span', { class: 'ri' }, iconEl(sprites, 'ui_rotate', 32, '↻')), h('span', { text: 'หมุน' }));
     const retBtn = h('button', { class: 'rbtn retreat', 'data-coach': 'ret', 'aria-label': 'ถอนกลับ แตะสองครั้งเพื่อยืนยัน', onClick: () => armRetreat() }, h('span', { class: 'ri' }, iconEl(sprites, 'ui_retreat', 32, '↩')), h('span', { text: 'ถอน' }));
     if (sim && sim.prog && sim.prog.retreat && sim.prog.retreatLeft > 0) { retBtn.append(h('i', { class: 'ret-badge', 'aria-hidden': 'true', text: '×' + sim.prog.retreatLeft })); retBtn.setAttribute('aria-label', retBtn.getAttribute('aria-label') + ' คืนทุนเต็มจำนวนได้อีก ' + sim.prog.retreatLeft + ' ครั้ง'); } // C08 Retreat & Refund charges
-    radial = h('div', { class: 'radial', 'data-coach': 'radial', role: 'group', 'aria-label': 'เมนูผู้ปฏิบัติงาน ' + op.def.th }, info, skillBtn, rotBtn, retBtn);
-    radial._op = op.id; radial._skill = skillBtn; radial._info = info; radial._rot = rotBtn; radial._ret = retBtn; radial._skillOn = skillOn;
+    const closeBtn = h('button', { class: 'rbtn rclose', 'aria-label': 'ปิดเมนู', onClick: () => clearSelection() }, h('span', { class: 'ri' }, iconEl(sprites, 'icon24_cross', 24, '✕')));
+    radial = h('div', { class: 'radial', 'data-coach': 'radial', role: 'group', 'aria-label': 'เมนูผู้ปฏิบัติงาน ' + op.def.th }, info, skillBtn, rotBtn, retBtn, closeBtn);
+    radial._close = closeBtn; radial._op = op.id; radial._skill = skillBtn; radial._info = info; radial._rot = rotBtn; radial._ret = retBtn; radial._skillOn = skillOn;
     overlay.append(scrim, radial);
     if (window.__coach && !(window.__coach.engine && window.__coach.engine.pending())) window.__coach.maybeStart('radial'); // first-time spotlight (src/ui/coach.js); not on top of the unit_moves tutorial
     if (d) d.setSlow('radial', true);
@@ -22763,6 +23089,10 @@ function createHud({ sprites, settings, audio, params = {}, hooks = {} }) {
     }
     radial._info.style.top = flip ? '-52px' : '30px';
     radial._info.style.left = '0px';
+    // close (✕) button beside the name plate, always on screen: the way out of the menu on touch (no Escape key)
+    const cx = Math.max(24, Math.min(w - 24, x + Math.max(radial._info.offsetWidth, 170) / 2 + 26));
+    radial._close.style.left = (cx - x) + 'px';
+    radial._close.style.top = ((flip ? -52 : 30) + 14) + 'px';
   }
   function sim_rows() { return H.sim ? H.sim.H : 9; }
 
@@ -23025,6 +23355,7 @@ function createHud({ sprites, settings, audio, params = {}, hooks = {} }) {
       h('h2', { text: 'พักเกม' }),
       h('p', { class: 'sub', text: 'เวลาหยุดแล้ว และซ่อนสนามไว้ชั่วคราว' }),
       h('button', { class: 'btn primary big', onClick: closePause }, h('span', { class: 'ic' }, iconEl(sprites, 'ui_ff', 32, '▶')), 'เล่นต่อ'),
+      h('button', { class: 'btn', 'data-act': 'cardbook', text: 'ดูการ์ดของฉัน', onClick: () => openCardBook() }),
       toggleRow('เสียง', () => settings.sound, (v) => { settings.sound = v; audio.setEnabled(v); hooks.onSettings && hooks.onSettings(); }),
       toggleRow('ออโต้ (ให้เกมเล่นให้)', () => d.autoMode, (v) => { d.setAuto(v); settings.autoMode = v; hooks.onSettings && hooks.onSettings(); syncAuto(); }),
       speedRow(d),
@@ -23041,6 +23372,16 @@ function createHud({ sprites, settings, audio, params = {}, hooks = {} }) {
     ]);
     pauseModal.classList.add('solid'); // solid cover, not a see-through scrim: nothing of the field / hand / lanes can be read while the clock is stopped
     pauseModal.querySelector('.btn.primary').focus();
+  }
+  let cardBook = null;
+  function openCardBook() {
+    const d = H.director;
+    if (!d || !d.sim || cardBook) return;
+    audio.play('tap');
+    const close = () => { if (cardBook) { cardBook.remove(); cardBook = null; } if (pauseModal) { const b = pauseModal.querySelector('[data-act="cardbook"]'); if (b) b.focus(); } };
+    cardBook = modal(cardBookContent({ sprites, sim: d.sim, onClose: close }));
+    cardBook.classList.add('solid', 'cb');
+    cardBook.querySelector('.btn.primary').focus();
   }
   let exitModal = null;
   function openExit() {
@@ -25533,6 +25874,57 @@ const hits = createHits();
 
 Object.defineProperty(__exp, "createHits", { enumerable: true, get: () => createHits });
 Object.defineProperty(__exp, "hits", { enumerable: true, get: () => hits });
+};
+__defs["src/ui/cardbook.js"] = function(__exp, __req, __dyn) {
+// Card book "การ์ดของฉัน": every unlocked card (name, DP cost, role, range, skill, description) readable any time from the pause menu.
+// Pure DOM; returns the content for hud.js modal() whose Escape handler clicks the primary button ('ปิด').
+const { h, spriteEl, emojiFor } = __req("src/ui/dom.js");
+const { cardDef, isOperator, BASE_DECK } = __req("src/td/units.js");
+const { cardCopy } = __req("src/ui/ceremony.js");
+
+const RANGE = { F1: 'ด้านหน้า 1 ช่อง', F2cone: 'ด้านหน้าเป็นกรวย 2 ช่อง', F3: 'ด้านหน้า 3 ช่อง', C1: 'รอบตัว 1 ช่อง', C2: 'รอบตัว 2 ช่อง' };
+
+/** keys of the cards this run has unlocked (hand + pile + returning + on the field), in the base deck order */
+function unlockedKeys(sim) {
+  const set = new Set();
+  const d = sim.deck;
+  for (const c of d.hand) if (c) set.add(c.key);
+  for (const c of d.pile) set.add(c.key);
+  for (const r of d.returning) set.add(r.card.key);
+  for (const o of sim.ops) set.add(o.key);
+  const rank = (k) => { const i = BASE_DECK.indexOf(k); return i < 0 ? 99 : i; };
+  return [...set].filter((k) => cardDef(k)).sort((a, b) => rank(a) - rank(b));
+}
+
+function row(label, text) { return text ? h('div', { class: 'cb-r' }, h('b', { text: label }), h('span', { text })) : null; }
+
+function cardItem(sprites, key) {
+  const def = cardDef(key), copy = cardCopy(key), op = isOperator(key);
+  const head = h('div', { class: 'cb-h' },
+    spriteEl(sprites, def.sprite, { fallback: emojiFor(key), size: 48, cls: 'pxi' }),
+    h('div', { class: 'cb-t' }, h('b', { text: copy.name }), h('small', { text: copy.role })),
+    h('span', { class: 'cb-dp', text: '⚡' + def.cost + ' DP' }));
+  const rows = op ? [
+    row('บทบาท', def.ground ? 'วางบนทางเดิน ยืนบล็อกศัตรู' : 'วางบนพื้นสูง โจมตีจากระยะ'),
+    row('ระยะ', RANGE[def.shape] || ''),
+    row('ค่าสถานะ', `พลังชีวิต ${def.hp} · โจมตี ${def.atk}` + (def.block ? ` · บล็อก ${def.block}` : '')),
+    row('สกิล ' + def.skill, def.skillDesc),
+  ] : [row('ผล', def.desc), row('เวลา', def.dur ? def.dur + ' วินาที' : 'ทันที')];
+  return h('div', { class: 'cb-item', 'data-cardbook': key }, head, ...rows, row('ทำไมสำคัญ', copy.meaning || def.teach));
+}
+
+function cardBookContent({ sprites, sim, onClose }) {
+  const keys = unlockedKeys(sim);
+  return [
+    h('h2', { text: 'การ์ดของฉัน' }),
+    h('p', { class: 'sub', text: `ปลดล็อกแล้ว ${keys.length} ใบ เลื่อนดูได้ทุกใบ` }),
+    h('div', { class: 'cb-list' }, keys.map((k) => cardItem(sprites, k))),
+    h('button', { class: 'btn primary big', 'data-act': 'cardbook-close', text: 'ปิด', onClick: onClose }),
+  ];
+}
+
+Object.defineProperty(__exp, "unlockedKeys", { enumerable: true, get: () => unlockedKeys });
+Object.defineProperty(__exp, "cardBookContent", { enumerable: true, get: () => cardBookContent });
 };
 __defs["src/ui/codes_ui.js"] = function(__exp, __req, __dyn) {
 // UI blocks for the two codes (docs/CODES.md): ref-code panel on the results screen, resume-code panels
@@ -28618,7 +29010,7 @@ Object.defineProperty(__exp, "STARS_CSS", { enumerable: true, get: () => STARS_C
 __defs["src/core/version.js"] = function(__exp, __req, __dyn) {
 // Build stamp shown on the title screen (and in <html data-build>) so anyone can tell which build they are playing.
 // `node tools/build.mjs` replaces the value with 'YYYY-MM-DD HH:mm · <git short hash>'; the dev server shows 'dev'.
-const BUILD = "2026-10-30 09:43 · 41d283d";
+const BUILD = "2026-10-30 13:31 · 168cb2d";
 
 Object.defineProperty(__exp, "BUILD", { enumerable: true, get: () => BUILD });
 };
@@ -28894,159 +29286,6 @@ Object.defineProperty(__exp, "startTicket", { enumerable: true, get: () => start
 Object.defineProperty(__exp, "attachTrust", { enumerable: true, get: () => attachTrust });
 Object.defineProperty(__exp, "sigText", { enumerable: true, get: () => sigText });
 Object.defineProperty(__exp, "currentTicket", { enumerable: true, get: () => currentTicket });
-};
-__defs["src/core/secret.js"] = function(__exp, __req, __dyn) {
-// The game <-> server shared secret.  `node tools/build.mjs` replaces the value with the one in tools/.secret (git-ignored, made on the first build;
-// the same text goes into the Apps Script property TRACE_KEY, see apps-script/README.md).  The checked-in value is only for local development.
-const SECRET = "E3bXY6p0YEQUw8w1Sl_Y1G71YzC5dixl";
-
-Object.defineProperty(__exp, "SECRET", { enumerable: true, get: () => SECRET });
-};
-__defs["src/core/sealed.js"] = function(__exp, __req, __dyn) {
-// Synchronous authenticated encryption for everything this game keeps on the device (and the signature the server checks).
-//   sha256 / hmacSha256 (RFC 6234 / 2104), chacha20 (RFC 8439), seal / open = ChaCha20 + HMAC-SHA256 (encrypt-then-MAC, 128-bit tag).
-// Sync on purpose: the game reads and writes localStorage synchronously in ~20 places; WebCrypto is async-only.
-// What it gives: nobody can read OR edit a stored value without the key; a flipped bit = rejected.  What no client-side scheme can give: the key has
-// to sit inside the game for the game to read its own save, so a determined owner of the device who reverse-engineers the bundle can get it.  The server
-// therefore never trusts the stored values: it re-derives the same key (src/core/secure_store.js 'sign') and rejects what does not verify.
-const K = new Uint32Array([
-  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
-]);
-const rotr = (x, n) => (x >>> n) | (x << (32 - n));
-
-function utf8(s) { return typeof s === 'string' ? new TextEncoder().encode(s) : s; }
-
-function sha256(msg) {
-  const m = utf8(msg);
-  const h = new Uint32Array([0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]);
-  const n = m.length, padLen = ((n + 9 + 63) >> 6) << 6;
-  const b = new Uint8Array(padLen);
-  b.set(m); b[n] = 0x80;
-  const dv = new DataView(b.buffer);
-  dv.setUint32(padLen - 8, Math.floor((n * 8) / 4294967296), false);
-  dv.setUint32(padLen - 4, (n * 8) >>> 0, false);
-  const w = new Uint32Array(64);
-  for (let o = 0; o < padLen; o += 64) {
-    for (let i = 0; i < 16; i++) w[i] = dv.getUint32(o + i * 4, false);
-    for (let i = 16; i < 64; i++) {
-      const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3), s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
-      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) | 0;
-    }
-    let a = h[0], bb = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
-    for (let i = 0; i < 64; i++) {
-      const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25), ch = (e & f) ^ (~e & g), t1 = (hh + S1 + ch + K[i] + w[i]) | 0;
-      const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22), mj = (a & bb) ^ (a & c) ^ (bb & c), t2 = (S0 + mj) | 0;
-      hh = g; g = f; f = e; e = (d + t1) | 0; d = c; c = bb; bb = a; a = (t1 + t2) | 0;
-    }
-    h[0] += a; h[1] += bb; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
-  }
-  const out = new Uint8Array(32), ov = new DataView(out.buffer);
-  for (let i = 0; i < 8; i++) ov.setUint32(i * 4, h[i], false);
-  return out;
-}
-
-function concat(...parts) {
-  let n = 0; for (const p of parts) n += p.length;
-  const o = new Uint8Array(n); let k = 0;
-  for (const p of parts) { o.set(p, k); k += p.length; }
-  return o;
-}
-
-function hmacSha256(key, msg) {
-  let k = utf8(key);
-  if (k.length > 64) k = sha256(k);
-  const ip = new Uint8Array(64).fill(0x36), op = new Uint8Array(64).fill(0x5c);
-  for (let i = 0; i < k.length; i++) { ip[i] ^= k[i]; op[i] ^= k[i]; }
-  return sha256(concat(op, sha256(concat(ip, utf8(msg)))));
-}
-
-/** ChaCha20 (RFC 8439): key 32 bytes, nonce 12 bytes, 32-bit block counter */
-function chacha20(key, nonce, data, counter = 1) {
-  const st = new Uint32Array(16), x = new Uint32Array(16), out = new Uint8Array(data.length);
-  const kv = new DataView(key.buffer, key.byteOffset, 32), nv = new DataView(nonce.buffer, nonce.byteOffset, 12);
-  st[0] = 0x61707865; st[1] = 0x3320646e; st[2] = 0x79622d32; st[3] = 0x6b206574;
-  for (let i = 0; i < 8; i++) st[4 + i] = kv.getUint32(i * 4, true);
-  for (let i = 0; i < 3; i++) st[13 + i] = nv.getUint32(i * 4, true);
-  const qr = (a, b, c, d) => {
-    x[a] += x[b]; x[d] = ((x[d] ^ x[a]) << 16) | ((x[d] ^ x[a]) >>> 16);
-    x[c] += x[d]; x[b] = ((x[b] ^ x[c]) << 12) | ((x[b] ^ x[c]) >>> 20);
-    x[a] += x[b]; x[d] = ((x[d] ^ x[a]) << 8) | ((x[d] ^ x[a]) >>> 24);
-    x[c] += x[d]; x[b] = ((x[b] ^ x[c]) << 7) | ((x[b] ^ x[c]) >>> 25);
-  };
-  for (let off = 0; off < data.length; off += 64, counter++) {
-    st[12] = counter >>> 0;
-    x.set(st);
-    for (let r = 0; r < 10; r++) { qr(0, 4, 8, 12); qr(1, 5, 9, 13); qr(2, 6, 10, 14); qr(3, 7, 11, 15); qr(0, 5, 10, 15); qr(1, 6, 11, 12); qr(2, 7, 8, 13); qr(3, 4, 9, 14); }
-    const end = Math.min(64, data.length - off);
-    for (let i = 0; i < end; i++) { const word = (x[i >> 2] + st[i >> 2]) >>> 0; out[off + i] = data[off + i] ^ ((word >>> ((i & 3) * 8)) & 255); }
-  }
-  return out;
-}
-
-function randomBytes(n) {
-  const a = new Uint8Array(n);
-  try { globalThis.crypto.getRandomValues(a); } catch (e) { for (let i = 0; i < n; i++) a[i] = Math.floor(Math.random() * 256); }
-  return a;
-}
-
-const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
-function b64(bytes) {
-  let s = '';
-  for (let i = 0; i < bytes.length; i += 3) {
-    const n = (bytes[i] << 16) | ((bytes[i + 1] || 0) << 8) | (bytes[i + 2] || 0);
-    s += B64[(n >> 18) & 63] + B64[(n >> 12) & 63] + (i + 1 < bytes.length ? B64[(n >> 6) & 63] : '') + (i + 2 < bytes.length ? B64[n & 63] : '');
-  }
-  return s;
-}
-function unb64(s) {
-  const out = [];
-  let acc = 0, bits = 0;
-  for (const ch of s) {
-    const v = B64.indexOf(ch);
-    if (v < 0) return null;
-    acc = (acc << 6) | v; bits += 6;
-    if (bits >= 8) { bits -= 8; out.push((acc >> bits) & 255); acc &= (1 << bits) - 1; }
-  }
-  return Uint8Array.from(out);
-}
-const hex = (b) => Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
-
-const ctEq = (a, b) => { if (a.length !== b.length) return false; let d = 0; for (let i = 0; i < a.length; i++) d |= a[i] ^ b[i]; return d === 0; };
-
-/** key (32 bytes) + context string (bound into the tag: a value cannot be moved under another name) -> base64url text */
-function seal(key, context, plaintext, nonce = randomBytes(12)) {
-  const ek = hmacSha256(key, 'enc'), mk = hmacSha256(key, 'mac');
-  const ct = chacha20(ek, nonce, utf8(plaintext));
-  const tag = hmacSha256(mk, concat(utf8(context + '\0'), nonce, ct)).subarray(0, 16);
-  return b64(concat(nonce, ct, tag));
-}
-/** -> plaintext string, or null when the text was altered / made for another key or name */
-function open(key, context, text) {
-  const raw = unb64(String(text));
-  if (!raw || raw.length < 28) return null;
-  const nonce = raw.subarray(0, 12), ct = raw.subarray(12, raw.length - 16), tag = raw.subarray(raw.length - 16);
-  const ek = hmacSha256(key, 'enc'), mk = hmacSha256(key, 'mac');
-  if (!ctEq(hmacSha256(mk, concat(utf8(context + '\0'), nonce, ct)).subarray(0, 16), tag)) return null;
-  try { return new TextDecoder().decode(chacha20(ek, nonce, ct)); } catch (e) { return null; }
-}
-/** detached signature (hex, 128 bit) of a text under a key: what the server re-computes */
-const sign = (key, text) => hex(hmacSha256(key, text).subarray(0, 16));
-
-Object.defineProperty(__exp, "utf8", { enumerable: true, get: () => utf8 });
-Object.defineProperty(__exp, "sha256", { enumerable: true, get: () => sha256 });
-Object.defineProperty(__exp, "concat", { enumerable: true, get: () => concat });
-Object.defineProperty(__exp, "hmacSha256", { enumerable: true, get: () => hmacSha256 });
-Object.defineProperty(__exp, "chacha20", { enumerable: true, get: () => chacha20 });
-Object.defineProperty(__exp, "randomBytes", { enumerable: true, get: () => randomBytes });
-Object.defineProperty(__exp, "b64", { enumerable: true, get: () => b64 });
-Object.defineProperty(__exp, "unb64", { enumerable: true, get: () => unb64 });
-Object.defineProperty(__exp, "seal", { enumerable: true, get: () => seal });
-Object.defineProperty(__exp, "open", { enumerable: true, get: () => open });
-Object.defineProperty(__exp, "hex", { enumerable: true, get: () => hex });
-Object.defineProperty(__exp, "sign", { enumerable: true, get: () => sign });
 };
 __defs["src/metrics/uploader.js"] = function(__exp, __req, __dyn) {
 // Upload queue for run reports (docs/CODES.md section 1).  Pure logic with injected fetch / storage / clock, so it is unit-testable.
@@ -37487,8 +37726,11 @@ __defs["src/core/boot_storage.js"] = function(__exp, __req, __dyn) {
 const { SECRET } = __req("src/core/secret.js");
 const { installSecureStorage } = __req("src/core/secure_store.js");
 const { isLocalHost } = __req("src/core/consent_store.js");
+const { wipeIfStale } = __req("src/core/retention.js");
 
 const secure = typeof window !== 'undefined' ? installSecureStorage(window, SECRET, isLocalHost(window.location)) : null;
+// unused for 90 days -> forget everything this device kept (matches the server's 90-day rule)
+if (typeof window !== 'undefined' && secure) wipeIfStale(window.localStorage);
 
 Object.defineProperty(__exp, "secure", { enumerable: true, get: () => secure });
 };
@@ -37566,6 +37808,35 @@ function installSecureStorage(win, secret, devOk) {
 
 Object.defineProperty(__exp, "createSecureStorage", { enumerable: true, get: () => createSecureStorage });
 Object.defineProperty(__exp, "installSecureStorage", { enumerable: true, get: () => installSecureStorage });
+};
+__defs["src/core/retention.js"] = function(__exp, __req, __dyn) {
+// Local retention: a device that was not used for RETENTION_DAYS forgets everything the game kept (progress, unlocks, consent, queued reports and trace).
+// Mirrors the server rule (rows older than 90 days are archived and deleted), so no data outlives the study on either side.  Pure: storage and clock injected.
+const RETENTION_DAYS = 90;
+const SEEN_KEY = 'tpdv_seen';
+const GAME = /^(tpdv|tp_)/;
+const KEEP = new Set(['tpdv_salt', 'tpdv_enc']);   // the sealed-storage layer's own key material: removing it would make what is written next unreadable
+
+/** call once at boot.  Returns true when the old data was wiped. */
+function wipeIfStale(storage, now = Date.now(), days = RETENTION_DAYS) {
+  try {
+    if (!storage) return false;
+    const seen = +storage.getItem(SEEN_KEY) || 0;
+    let wiped = false;
+    if (seen && now - seen > days * 86400000) {
+      const names = [];
+      for (let i = 0; i < storage.length; i++) { const k = storage.key(i); if (k && GAME.test(k) && !KEEP.has(k)) names.push(k); }
+      for (const k of names) storage.removeItem(k);
+      wiped = true;
+    }
+    storage.setItem(SEEN_KEY, String(now));
+    return wiped;
+  } catch (e) { return false; }
+}
+
+Object.defineProperty(__exp, "wipeIfStale", { enumerable: true, get: () => wipeIfStale });
+Object.defineProperty(__exp, "RETENTION_DAYS", { enumerable: true, get: () => RETENTION_DAYS });
+Object.defineProperty(__exp, "SEEN_KEY", { enumerable: true, get: () => SEEN_KEY });
 };
 __lazy["src/core/audit.js"] = "\"use strict\";\n// Game audit manager: watches a running director and reports anything that breaks the rules of a run.  Pure (no DOM, no storage); the director never depends on it.\n//   const audit = createAudit(director, { onIssue })      call  audit.before()  right before and  audit.tick(dtReal)  right AFTER every director.tick(dtReal)   (tests / tools/audit_run.mjs always; the game with ?audit=1)\n//   audit.issues                     [{ code, sev: 'error'|'warn', t (run clock), msg, data }]  (each code at most 3 times per run)\n//   audit.summary()                  { errors, warns, byCode, waves: [{ no, planned, left, alive, cut, wall, budget }] }\n// Rules (docs/AUDIT.md):\n//   spawn_stall        due enemies of the wave did not spawn for 18 s of sim time although the alive cap is not the reason\n//   cap_stall          the alive cap blocks spawns for 60 s of sim time (nothing alive gets killed)\n//   clear_not_ended    every enemy of the wave is dead and spawned, yet the wave goes on for > rest + 4 s of run clock\n//   only_usb_left      only a USB stick is left for > 25 s: the wave waits for it\n//   wave_cut           a wave ended by its time budget with enemies unspawned / alive (the player did not get to finish it)\n//   wave_overrun       a wave's wall time went > 20 s past its budget (the 12 s grace for enemies still walking is allowed)\n//   clock_policy       the run clock / sim time did not follow the pause / hold / event rule of that state\n//   no_wave_enemies    a wave's plan is empty (nothing would ever come)\n//   boss_missing       the boss state started without a boss in the plan / sim\nfunction createAudit(D, { onIssue } = {}) {\n  const A = { issues: [], waves: [] };\n  const seen = {};\n  const add = (code, sev, msg, data) => {\n    seen[code] = (seen[code] || 0) + 1;\n    if (seen[code] > 3) return;\n    const it = { code, sev, t: +D.clock.toFixed(1), msg, data: data || {} };\n    A.issues.push(it);\n    if (onIssue) { try { onIssue(it); } catch (e) { /* observer only */ } }\n  };\n  let prev = null; // { clock, simT, state, sim }\n  let lastProgress = 0, lastDone = -1, capSince = 0, clearedFor = 0, usbOnlyFor = 0;\n  let curWave = null, snap = null;\n\n  function waveSnapshot() {\n    const sim = D.sim, w = sim && sim.wave;\n    if (!w) return null;\n    let planLeft = 0;\n    for (const p of w.plan) if (!p.done) planLeft++;\n    return { no: w.no, planned: w.size, planLeft, spawnedAll: w.spawnedAll, alive: sim.enemies.filter((e) => !e.dead && e.type !== 'usb').length, elites: sim.enemies.filter((e) => !e.dead && (e.type === 'ransom' || e.type === 'goblin' || e.type === 'meetbot')).length, wallT: D.wave ? D.wave.wallT : 0, budget: D.wave ? D.wave.budget : 0 };\n  }\n\n  // call right BEFORE director.tick(dt): the state may legitimately change between two ticks (an event's continuation runs between them)\n  A.before = () => { prev = { clock: D.clock, simT: D.sim ? D.sim.t : 0, state: D.state, sim: D.sim }; };\n\n  A.tick = (dt) => {\n    const sim = D.sim;\n    const cur = { clock: D.clock, simT: sim ? sim.t : 0, state: D.state, sim };\n    // ---- clock policy (only when state and sim did not change inside the tick) ----\n    if (prev && prev.sim === sim && prev.state === D.state && sim && !D.finished) {\n      const dClock = cur.clock - prev.clock, dSim = cur.simT - prev.simT;\n      const frozen = D.paused || D.evPaused || D.hold || D.holdExt;\n      const dtEff = Math.min(D.paused || D.state === 'event' ? 5 : 0.25, Math.max(0, dt));\n      const bad = (what) => add('clock_policy', 'error', what, { state: D.state, dt: +dt.toFixed(3), dClock: +dClock.toFixed(3), dSim: +dSim.toFixed(3), speed: D.speed, slowmo: D.slowmo, paused: !!D.paused, evPaused: !!D.evPaused, hold: !!D.hold, holdExt: !!D.holdExt, tdRun: !!D._evTd });\n      if (D.state === 'briefing' || D.state === 'idle' || D.state === 'done' || D.state === 'endreview') { /* not a running state */ }\n      else if (frozen) { if (dClock > 1e-6 || dSim > 1e-6) bad('time advanced while paused / held'); }\n      else {\n        if (Math.abs(dClock - dtEff) > 1e-3) bad('run clock did not advance by dt');\n        if (D.state === 'event') {\n          if (D._evTd) { if (dSim > dtEff * 1.01 + 1e-6) bad('TD behind a question ran faster than x1'); }\n          else if (dSim > 1e-6) bad('TD moved behind a question that should freeze it');\n        } else if (D.state === 'wave' || D.state === 'boss') {\n          const want = dtEff * D.speed * D.slowmo;\n          if (Math.abs(dSim - want) > 0.011 + want * 0.02) bad('sim time did not follow dt x speed x slow-mo');\n        }\n      }\n    }\n    prev = null;\n    if (!sim || D.finished) return;\n    // ---- waves ----\n    const w = sim.wave;\n    const dw = D.wave;\n    if (dw !== curWave) { // a wave ended (or began): judge the one that just ended from the last snapshot\n      if (curWave && snap) {\n        const le = D.lastWaveEnd && D.lastWaveEnd.no === snap.no ? D.lastWaveEnd : null;\n        const cut = !!le && le.reason === 'budget' && (le.planLeft > 0 || le.alive > 0);\n        A.waves.push({ no: snap.no, planned: snap.planned, left: le ? le.planLeft : snap.planLeft, alive: le ? le.alive : snap.alive, cut, reason: le ? le.reason : '?', wall: +snap.wallT.toFixed(1), budget: +snap.budget.toFixed(1) });\n        if (cut) add('wave_cut', 'warn', `wave ${snap.no} ended by its time budget with ${le.planLeft} unspawned and ${le.alive} alive`, le);\n        if (snap.wallT > snap.budget + 20) add('wave_overrun', 'error', `wave ${snap.no} ran ${(snap.wallT - snap.budget).toFixed(1)} s past its budget (grace is 12 s)`, snap);\n      }\n      curWave = dw; snap = null; lastProgress = 0; lastDone = -1; capSince = 0; clearedFor = 0; usbOnlyFor = 0;\n      if (dw && w && w.size === 0 && w.no !== 0) add('no_wave_enemies', 'error', `wave ${w.no} has an empty plan`, { no: w.no });\n    }\n    if (D.state === 'boss' && w && !w.plan.some((p) => p.type === 'hydra')) add('boss_missing', 'error', 'boss state without a boss in the plan', {});\n    if ((D.state === 'wave' || D.state === 'boss') && w && !D.paused && !D.hold && !D.holdExt && !D.evPaused) {\n      snap = waveSnapshot();\n      const done = w.plan.reduce((a, p) => a + (p.done ? 1 : 0), 0);\n      if (done !== lastDone) { lastDone = done; lastProgress = sim.t; capSince = 0; }\n      let due = 0;\n      for (const p of w.plan) if (!p.done && p.at <= w.t) due++;\n      if (due > 0 && !w.spawnedAll) {\n        const alive = snap.alive;\n        const eliteDue = !!sim.fair && w.plan.some((p) => !p.done && p.at <= w.t && (p.type === 'ransom' || p.type === 'goblin' || p.type === 'meetbot' || p.type === 'hydra')) && snap.elites >= sim.fair.eliteCap;\n        if (alive >= sim.aliveCap || eliteDue) { lastProgress = sim.t; if (!capSince) capSince = sim.t; if (sim.t - capSince > 60) add('cap_stall', 'warn', 'the alive cap has blocked spawns for 60 s', { alive, cap: sim.aliveCap, due }); }\n        else { capSince = 0; if (sim.t - lastProgress > 18) add('spawn_stall', 'error', `${due} due enemies did not spawn for ${(sim.t - lastProgress).toFixed(0)} s`, { due, alive, cap: sim.aliveCap, wave: w.no, pending: w.plan.filter((p) => !p.done).slice(0, 4).map((p) => ({ type: p.type, spawn: p.spawn, at: +p.at.toFixed(1), open: sim.openSpawn(p.spawn), path: !!(sim.grid.paths[p.spawn] && sim.grid.paths[p.spawn].length), guarded: !!p.guarded })), elites: sim.enemies.filter((q) => !q.dead).map((q) => q.type) }); }\n      } else if (!due) { lastProgress = sim.t; capSince = 0; }\n      if (D.waveCleared && D.state === 'wave') {\n        if (D.waveCleared()) { clearedFor += dt; if (clearedFor > Math.max(1.5, D.lp.fair ? D.lp.fair.restSec : 0) + 4) add('clear_not_ended', 'error', 'wave is cleared but did not end', { no: w.no, clearedFor: +clearedFor.toFixed(1) }); } else clearedFor = 0;\n      }\n      if (w.spawnedAll && sim.enemies.length > 0 && sim.enemies.every((e) => e.type === 'usb' || e.dead)) { usbOnlyFor += dt; if (usbOnlyFor > 25) add('only_usb_left', 'warn', 'only a USB stick is left; the wave waits for it', { no: w.no }); } else usbOnlyFor = 0;\n    }\n  };\n\n  A.summary = () => {\n    const byCode = {};\n    for (const i of A.issues) byCode[i.code] = (byCode[i.code] || 0) + 1;\n    return { errors: A.issues.filter((i) => i.sev === 'error').length, warns: A.issues.filter((i) => i.sev === 'warn').length, byCode, waves: A.waves.slice() };\n  };\n  return A;\n}\n\nObject.defineProperty(__exp, \"createAudit\", { enumerable: true, get: () => createAudit });";
 __lazy["src/share/ui.js"] = "\"use strict\";\n// Share screen UI (DOM). Entry point for the Core results screen:\n//   const h = await showShareScreen(container, { runResult, tdStats, meta, sprites?, bank?, onReplay?, onClose?, qr? })\n//   h.destroy()\n// Large touch targets (>= 48px), text >= 18px, Thai UI copy. Respects prefers-reduced-motion.\nconst E = __req(\"src/share/engine.js\");\nconst { loadShareBank, setShareBank } = __req(\"src/share/stats.js\");\nconst { buildGallery } = __req(\"src/share/gallery.js\");\nconst { renderCard, drawCard, canvasToBlob, loadArt, setArt, FORMATS, RARITY_STYLE } = __req(\"src/share/card.js\");\n\nconst CSS = `\n/* Share / collection / shop screens in the pixel house style: dark navy band, ink-outlined paper panels, nine-slice pixel buttons\n   (--ni-* from src/ui/chrome.js). Text is cream on the dark band and ink on paper (>= 4.5:1); no blur, no radii. */\n.tpsh{font-family:'Noto Sans Thai','Sarabun','Leelawadee UI',Tahoma,sans-serif;color:#f5f7fb;background-color:#13203a;background-image:linear-gradient(#0b1324d9,#0b1324d9),var(--floor-img,none);background-size:auto,48px 48px;min-height:100%;box-sizing:border-box;padding:12px;font-size:18px;line-height:1.5}\n.tpsh *{box-sizing:border-box}\n.tpsh h2{font-size:24px;margin:8px 0;color:#efe6d2;text-shadow:0 3px 0 #0e1628}.tpsh h3{font-size:20px;margin:6px 0}\n.tpsh .wrap>div:not(.panel)>h3,.tpsh .wrap>h3{color:#efe6d2}\n.tpsh .wrap{max-width:560px;margin:0 auto}\n.tpsh .btn{font:inherit;font-size:18px;font-weight:700;min-height:48px;min-width:48px;padding:6px 14px;border:4px solid transparent;border-image:var(--ni-blue) var(--ni-slice,4) fill/4px stretch;image-rendering:pixelated;border-radius:0;background:none;color:#fff;cursor:pointer;box-shadow:0 4px 0 0 #0e1628;text-shadow:0 2px 0 #0e162888}\n.tpsh .btn:active{transform:translateY(2px);box-shadow:0 2px 0 0 #0e1628}\n.tpsh .btn.pri{border-image-source:var(--ni-red)}.tpsh .btn.on{border-image-source:var(--ni-gold);color:#0e1628;text-shadow:none}.tpsh .btn:disabled{opacity:.5;cursor:default;box-shadow:none}\n.tpsh .btn:focus-visible,.tpsh textarea:focus-visible{outline:4px solid #2e7dd7;outline-offset:3px}\n.tpsh .row{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}.tpsh .row>.btn{flex:1 1 140px}\n.tpsh .card-box{text-align:center}.tpsh canvas{width:100%;height:auto;max-width:540px;border-radius:0;box-shadow:0 0 0 2px #0e1628,0 0 0 6px #efe6d2,0 0 0 8px #0e1628,0 12px 0 8px #0e1628;background:#14203a;display:block;margin:12px auto 22px}\n.tpsh textarea{width:100%;font:inherit;font-size:18px;min-height:110px;border:2px solid #0e1628;border-radius:0;padding:8px;background:#fbf7ee;color:#0e1628}\n.tpsh .panel{border:4px solid transparent;border-image:var(--ni-paper) var(--ni-slice,4) fill/4px stretch;image-rendering:pixelated;background:none;color:#0e1628;border-radius:0;padding:6px 10px;margin:10px 0 14px;box-shadow:0 4px 0 0 #0e1628}\n.tpsh .coins td{padding:2px 6px}.tpsh .coins td:last-child{text-align:right;font-weight:700}\n.tpsh .reveal{position:fixed;inset:0;z-index:50;background:#0b1324f2;color:#f5f7fb;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;text-align:center;padding:20px}\n.tpsh .reveal .big{font-size:36px;font-weight:800;color:#efe6d2;text-shadow:0 3px 0 #0e1628}.tpsh .reveal .sub{font-size:20px;color:#dbe6f7}\n.tpsh .pop{animation:tpshpop .5s steps(6) both}.tpsh.reduce .pop{animation:none}\n@keyframes tpshpop{0%{transform:scale(.3);opacity:0}70%{transform:scale(1.12);opacity:1}100%{transform:scale(1)}}\n.tpsh .bdg{background:#fbf7ee;color:#0e1628;border:2px solid #0e1628;border-radius:0;padding:8px 14px;font-weight:700;font-size:20px;margin:4px;box-shadow:0 3px 0 #0e1628}\n.tpsh .toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:#1b2a4a;color:#efe6d2;padding:12px 18px;border:2px solid #efe6d2;box-shadow:0 0 0 2px #0e1628,0 6px 0 2px #0e1628;border-radius:0;z-index:80;font-size:18px;max-width:90vw}\n.tpsh .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px}\n.tpsh .slot{border:3px dashed #8fb3e0;border-radius:0;padding:8px;background:#1b2a4a;color:#efe6d2;min-height:96px;font-size:18px}\n.tpsh .slot.got{border-style:solid;border-color:#0e1628;background:#fbf7ee;color:#0e1628;box-shadow:0 3px 0 #0e1628}.tpsh .slot.locked{background:#13203a;color:#c8d0e0}\n.tpsh .slot.cursed.got{border-color:#a8004f;background:#ffe9f3;color:#0e1628}\n.tpsh .stamps{display:flex;gap:6px}.tpsh .stamps span{flex:1;text-align:center;border:2px dashed #5b5b66;border-radius:0;padding:4px 0;font-size:18px}.tpsh .stamps span.on{background:#157a42;color:#fff;border:2px solid #0e1628}\n.tpsh .shop{display:flex;justify-content:space-between;align-items:center;gap:8px;border-bottom:2px dotted #c9b994;padding:8px 0}\n.tpsh .shop .nm{flex:1}\n.tpsh .savesheet{position:fixed;inset:0;z-index:70;background:#0b1324f2;color:#f5f7fb;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;padding:16px;text-align:center}\n.tpsh .savesheet img{max-width:min(90vw,420px);max-height:60vh;box-shadow:0 0 0 2px #0e1628,0 0 0 6px #efe6d2,0 0 0 8px #0e1628}\n`;\n\nconst TONE_TH = { good: 'สายดี', bad: 'สายตีกลับ', quirk: 'สายแปลกตา' };\nconst reduced = () => { try { return !!(globalThis.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches); } catch (e) { return false; } };\nconst h = (tag, attrs, ...kids) => {\n  const el = document.createElement(tag);\n  for (const [k, v] of Object.entries(attrs || {})) {\n    if (k === 'class') el.className = v;\n    else if (k === 'text') el.textContent = v;\n    else if (k.startsWith('on')) el.addEventListener(k.slice(2).toLowerCase(), v);\n    else if (v === true) el.setAttribute(k, '');\n    else if (v !== false && v != null) el.setAttribute(k, v);\n  }\n  for (const c of kids.flat()) if (c != null) el.append(c.nodeType ? c : document.createTextNode(c));\n  return el;\n};\n\nasync function showShareScreen(container, opts = {}) {\n  const { runResult, tdStats, meta = {}, sprites, bank, onReplay, onClose, qr } = opts;\n  if (!document.getElementById('tpsh-css')) { const st = h('style', { id: 'tpsh-css' }); st.textContent = CSS; document.head.append(st); }\n  await E.loadAchievements();\n  void sprites; // the share art (pixel pigeon + SVG frames/badges) is loaded by card.js itself\n  await loadArt().catch(() => {});\n  if (bank) setShareBank(bank); else if (!meta.bank && !globalThis.__TPDV_BANK__) { try { await loadShareBank(); } catch (e) { /* stats degrade gracefully */ } }\n\n  const profile = E.loadProfile();\n  // opening the share screen again for the same run must not pay coins / count the attempt twice\n  const memo = (globalThis.__tpshMemo ||= new Map());\n  const memoKey = runResult && runResult.code;\n  let outcome, commit;\n  if (memoKey && memo.has(memoKey)) ({ outcome, commit } = memo.get(memoKey));\n  else {\n    outcome = E.evaluateRun(runResult, tdStats, meta, { profile, considerate: profile.considerate, bank });\n    commit = E.commitRun(profile, outcome);\n    if (memoKey) memo.set(memoKey, { outcome, commit });\n  }\n  const state = { format: 'portrait', captionIdx: Math.floor(Math.random() * 3), caption: null, edited: false, view: 'main', t: 0 };\n\n  const root = h('div', { class: 'tpsh' + (reduced() ? ' reduce' : '') });\n  container.replaceChildren(root);\n  let timer = null, destroyed = false;\n  const toast = (msg) => { const t = h('div', { class: 'toast', role: 'status', text: msg }); root.append(t); setTimeout(() => t.remove(), 2600); };\n\n  // card art style: 'pixel' (default stamp / pixel-art look) or 'svg' (SVG frames; opt-in via opts.style or ?cardstyle=svg)\n  const cardStyle = opts.style || (typeof location !== 'undefined' && /[?&]cardstyle=svg/.test(location.search) ? 'svg' : 'pixel');\n  const model = () => ({\n    style: cardStyle, outcome, format: state.format, callsign: E.callsignText(profile),\n    cosmetics: { hat: profile.cosmetics.equipped.hat, frame: profile.cosmetics.equipped.frame, sticker: !!profile.cosmetics.equipped.sticker },\n    t: state.t, qr: qr || null,\n  });\n\n  const canvas = document.createElement('canvas');\n  canvas.setAttribute('role', 'img');\n  const redraw = async () => {\n    canvas.setAttribute('aria-label', `การ์ดฉายา ${outcome.persona.nameTh} ${outcome.stats.overall} คะแนน`);\n    await renderCard(model(), canvas);\n  };\n  const animate = () => {\n    clearInterval(timer);\n    if (reduced() || destroyed) return;\n    if (!['epic', 'legendary'].includes(outcome.rarity) && !(profile.cosmetics.equipped.frame)) return;\n    timer = setInterval(() => {\n      if (state.view !== 'main' || document.hidden || !canvas.isConnected) return;\n      state.t += 0.12;\n      drawCard(canvas.getContext('2d'), model());\n    }, 120);\n  };\n  const resetCaption = () => { state.caption = E.makeCaption(outcome, state.captionIdx); state.edited = false; };\n  resetCaption();\n\n  // ---------------------------------------------------------------- main view\n  function mainView() {\n    state.view = 'main';\n    const cap = h('textarea', { 'aria-label': 'ข้อความสำหรับโพสต์', onInput: (e) => { state.caption = e.target.value; state.edited = true; } });\n    cap.value = state.caption;\n    const refreshCap = () => { cap.value = state.caption; };\n    const hasCursed = [outcome.persona, ...outcome.badges, outcome.realPersona].some((a) => a && a.rarity === 'cursed');\n\n    const copyText = async (txt) => {\n      try { await navigator.clipboard.writeText(txt); return true; } catch (e) {\n        try { cap.select(); return document.execCommand('copy'); } catch (e2) { return false; }\n      }\n    };\n    // file name: data-vault-card-<persona-slug>.png|jpg (an extension always, even where the browser ignores the download attribute)\n    const slug = String((outcome.persona && (outcome.persona.id || outcome.persona.key)) || 'card').replace(/^p_/, '').replace(/[^a-z0-9]+/gi, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'card';\n    const fileBase = 'data-vault-card-' + slug;\n    const flatten = (src) => { const c = document.createElement('canvas'); c.width = src.width; c.height = src.height; const x = c.getContext('2d'); x.fillStyle = '#ffffff'; x.fillRect(0, 0, c.width, c.height); x.drawImage(src, 0, 0); return c; }; // JPG has no alpha\n    const makeBlob = async (type) => {\n      const jpg = type === 'image/jpeg';\n      const raw = await canvasToBlob(jpg ? flatten(canvas) : canvas, type, jpg ? 0.92 : undefined);\n      return new Blob([raw], { type }); // explicit MIME on the blob\n    };\n    const download = async (type = 'image/png') => {\n      const ext = type === 'image/jpeg' ? 'jpg' : 'png';\n      const blob = await makeBlob(type);\n      const url = URL.createObjectURL(blob);\n      const a = h('a', { href: url, download: fileBase + '.' + ext, type, rel: 'noopener' });\n      const noNamedDownload = !('download' in a) || /iPhone|iPad|iPod|FBAN|FBAV|Line\\/|Instagram|MicroMessenger/i.test(navigator.userAgent || '');\n      if (noNamedDownload) {\n        // in-app browsers / iOS save a blob link without its name: show the image so it can be saved with a long press\n        const sheet = h('div', { class: 'savesheet', role: 'dialog', 'aria-label': 'บันทึกรูป' }, h('img', { src: url, alt: 'การ์ดของคุณ' }),\n          h('div', { text: 'กดค้างที่รูป แล้วเลือก \"บันทึกรูปภาพ\"' }),\n          h('button', { class: 'btn', text: 'ปิด', onClick: () => { sheet.remove(); URL.revokeObjectURL(url); } }));\n        root.append(sheet);\n        return;\n      }\n      document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 4000);\n    };\n    const share = async () => {\n      let blob;\n      try { blob = await makeBlob('image/png'); } catch (e) { toast('สร้างรูปไม่สำเร็จ ลองกดดาวน์โหลดแทน'); return; }\n      const file = new File([blob], fileBase + '.png', { type: 'image/png' });\n      if (navigator.canShare && navigator.canShare({ files: [file] })) {\n        try { await navigator.share({ files: [file], text: state.caption }); toast('ส่งการ์ดแล้ว'); return; } catch (e) { if (e && e.name === 'AbortError') return; }\n      }\n      await download();\n      const ok = await copyText(state.caption);\n      toast(ok ? 'บันทึกรูปแล้ว และคัดลอกข้อความให้แล้ว วางในแอปที่ต้องการได้เลย' : 'บันทึกรูปแล้ว กด \"คัดลอกข้อความ\" เพื่อคัดลอกข้อความ');\n    };\n\n    const fmtBtns = ['portrait', 'square'].map((f) => h('button', {\n      class: 'btn' + (state.format === f ? ' on' : ''), 'aria-pressed': String(state.format === f),\n      onClick: async () => { state.format = f; await redraw(); mainView(); }, text: f === 'portrait' ? 'แนวตั้ง' : 'จัตุรัส',\n    }));\n    const c = outcome.coins;\n    const coinRows = [['เหรียญพื้นฐาน', c.base], ['คะแนนความรู้', c.perf], ['คะแนนป้อมปราการ', c.defenseBon], ['ปลดล็อกใหม่', c.newUnlocks], ['ได้ซ้ำ', c.repeats], ['กระปุกออมสิน', c.piggyPaid]].filter((r) => r[1] > 0);\n    const wk = E.weeklyStamps(profile);\n    const days = ['จ.', 'อ.', 'พ.', 'พฤ.', 'ศ.', 'ส.', 'อา.'];\n    const dc = outcome.daily.challenge;\n    // dress the card right here: wear / take off what you own (hat, frame, sticker), the card redraws at once\n    function decorPanel() {\n      const eq = profile.cosmetics.equipped, owned = profile.cosmetics.owned;\n      const mine = E.ALL_COSMETICS.filter((c) => owned.includes(c.id) && ['hat', 'frame', 'sticker'].includes(c.type));\n      if (!mine.length) {\n        return h('div', { class: 'panel', 'data-decor': 'none' }, h('h3', { text: 'ของตกแต่งการ์ด' }), h('div', { text: 'ยังไม่มีของตกแต่ง เก็บเหรียญแล้วไปซื้อหมวก กรอบ หรือสติกเกอร์มาใส่ให้การ์ดได้' }),\n          h('div', { class: 'row' }, h('button', { class: 'btn', onClick: shopView, text: 'ไปร้านค้าตกแต่ง' })));\n      }\n      return h('div', { class: 'panel', 'data-decor': 'on' }, h('h3', { text: 'ของตกแต่งการ์ด (แตะเพื่อใส่ / ถอด)' }),\n        h('div', { class: 'row' }, ...mine.map((c) => {\n          const on = eq[c.type] === c.id;\n          return h('button', { class: 'btn' + (on ? ' on' : ''), 'aria-pressed': String(on), 'data-cos': c.id, text: (on ? '✓ ' : '') + c.nameTh, onClick: async () => { E.equipCosmetic(profile, c.id); E.rememberLook(profile, outcome); E.saveProfile(profile); await redraw(); mainView(); animate(); } });\n        })));\n    }\n    const frag = h('div', { class: 'wrap' },\n      h('h2', { text: 'การ์ดของคุณ' }),\n      outcome.short ? h('div', { class: 'panel', text: 'รอบนี้สั้นกว่า 4 นาที จึงเป็นการ \"ทดลองบิน\" ได้เฉพาะเหรียญพื้นฐาน เล่นให้ครบรอบเพื่อรับฉายาเต็มรูปแบบ' }) : null,\n      h('div', { class: 'card-box' }, canvas),\n      decorPanel(),\n      h('div', { class: 'row' }, fmtBtns),\n      hasCursed ? h('div', { class: 'row' }, h('button', {\n        class: 'btn' + (outcome.considerate ? ' on' : ''), 'aria-pressed': String(!!outcome.considerate),\n        onClick: async () => { profile.considerate = !outcome.considerate; E.applyConsiderate(outcome, profile.considerate); E.saveProfile(profile); resetCaption(); await redraw(); mainView(); animate(); },\n        text: outcome.considerate ? 'โหมดเกรงใจ: เปิดอยู่ (แสดงการ์ดสุภาพ)' : 'โหมดเกรงใจ: ปิด (กดเพื่อซ่อนการ์ดตีกลับ)',\n      })) : null,\n      h('div', { class: 'panel' },\n        h('h3', { text: 'ข้อความสำหรับโพสต์' }), cap,\n        h('div', { class: 'row' },\n          h('button', { class: 'btn', 'aria-label': 'สุ่มข้อความใหม่', onClick: () => { state.captionIdx++; resetCaption(); refreshCap(); }, text: '🔄 ข้อความอื่น' }),\n          h('button', { class: 'btn', onClick: async () => toast((await copyText(state.caption)) ? 'คัดลอกข้อความแล้ว' : 'คัดลอกไม่ได้ ลองเลือกข้อความแล้วคัดลอกเอง'), text: 'คัดลอกข้อความ' }))),\n      h('div', { class: 'row' },\n        h('button', { class: 'btn pri', onClick: share, text: 'แชร์' }),\n        h('button', { class: 'btn', 'data-act': 'download-png', onClick: async () => { await download('image/png'); toast('บันทึกรูปแล้ว'); }, text: 'ดาวน์โหลด' })),\n      h('div', { class: 'panel' },\n        h('h3', { text: `เหรียญรอบนี้ +${c.total}` }),\n        h('table', { class: 'coins' }, ...coinRows.map((r) => h('tr', null, h('td', { text: r[0] }), h('td', { text: '+' + r[1] }))),\n          outcome.daily.bonus ? h('tr', null, h('td', { text: 'แสตมป์ประจำวัน' }), h('td', { text: '+' + outcome.daily.bonus })) : null),\n        h('div', { text: `เหรียญสะสมของคุณ ${profile.coins} เหรียญ` + (profile.piggy ? ` · กระปุกออมสิน ${profile.piggy} (จะจ่ายรอบหน้า)` : '') }),\n        c.raw > E.COIN_CAP && !c.short ? h('div', { text: `ถึงเพดาน ${E.COIN_CAP} เหรียญแล้ว ส่วนเกินเก็บเข้ากระปุกออมสิน` }) : null),\n      h('div', { class: 'panel' },\n        h('h3', { text: 'แสตมป์ประจำวัน' }),\n        dc ? h('div', { text: `${dc.labelTh}${outcome.daily.success ? ' ✔ ได้แสตมป์แล้ว' : outcome.daily.alreadyDone ? ' (วันนี้ได้แสตมป์แล้ว)' : ' (ยังไม่สำเร็จ ลองใหม่ได้)'}` }) : null,\n        h('div', { class: 'stamps' }, ...[0, 1, 2, 3, 4, 5, 6].map((i) => h('span', { class: wk[i] ? 'on' : '', text: days[i] + (wk[i] ? ' ✔' : '') }))),\n        h('div', { text: 'ครบ 5 ใน 7 วัน รับหมวกพิราบประจำสัปดาห์ (ไม่มีสถิติต่อเนื่อง ไม่มีโทษถ้าเว้นวัน)' })),\n      h('div', { class: 'panel' },\n        h('div', { text: 'ชื่อเรียก: ' + E.callsignText(profile) }),\n        h('div', { class: 'row' }, h('button', {\n          class: 'btn', onClick: async () => {\n            const r = E.rerollCallsign(profile);\n            if (!r.ok) { toast(`เหรียญไม่พอ (ต้องใช้ ${r.cost})`); return; }\n            await redraw(); mainView();\n          }, text: profile.callsign.rerolls >= 1 ? 'สุ่มชื่อใหม่ (30 เหรียญ)' : 'สุ่มชื่อใหม่ (ฟรีครั้งแรก)',\n        }))),\n      h('div', { class: 'row' },\n        h('button', { class: 'btn', onClick: collectionView, text: `สมุดสะสมแสตมป์ ${E.collectionCount(profile)}/${E.getAchievements().length}` }),\n        h('button', { class: 'btn', onClick: shopView, text: 'ร้านค้าตกแต่ง' })),\n      h('div', { class: 'row' },\n        onReplay ? h('button', { class: 'btn pri', onClick: () => onReplay(), text: 'เล่นอีกครั้ง' }) : null,\n        onClose ? h('button', { class: 'btn', onClick: () => onClose(), text: 'กลับ' }) : null),\n    );\n    root.replaceChildren(frag);\n    refreshCap();\n    animate();\n  }\n\n  // ---------------------------------------------------------------- collection book\n  async function collectionView() {\n    state.view = 'collection';\n    clearInterval(timer);\n    const gallery = await buildGallery({ profile });\n    const list = E.getAchievements();\n    const have = E.collectionCount(profile);\n    const groups = ['good', 'bad', 'quirk'].map((tone) => h('div', null,\n      h('h3', { text: TONE_TH[tone] }),\n      h('div', { class: 'grid' }, ...list.filter((a) => a.tone === tone).map((a) => {\n        const got = profile.collection[a.id];\n        const hidden = !got && a.rarity === 'legendary';\n        return h('div', { class: 'slot ' + (got ? 'got' : 'locked') + (a.rarity === 'cursed' ? ' cursed' : ''), 'aria-label': got ? a.nameTh : 'ยังไม่ปลดล็อก' },\n          h('div', { text: got ? a.nameTh : hidden ? '???' : '🔒 ' + (got ? '' : '') }),\n          got ? h('div', { text: `${RARITY_STYLE[a.rarity].nameTh} · ได้ ${got.timesEarned} ครั้ง` }) : h('div', { text: a.subTh }));\n      }))));\n    const next = E.REWARDS.find((r) => !profile.cosmetics.owned.includes(r.id));\n    const confirmBox = h('div');\n    root.replaceChildren(h('div', { class: 'wrap' },\n      h('h2', { text: `สมุดสะสมแสตมป์ ${have}/${list.length}` }),\n      h('div', { class: 'panel', text: next ? `สะสมครบ ${next.need} ใบ รับ \"${next.nameTh}\"` : 'สะสมครบทุกรางวัลแล้ว เก่งมาก!' }),\n      h('h3', { text: 'สมุดการ์ด' }), gallery,\n      ...groups,\n      h('div', { class: 'row' },\n        h('button', { class: 'btn', onClick: () => { gallery.destroy(); mainView(); redraw(); }, text: 'กลับ' }),\n        h('button', {\n          class: 'btn', text: 'ล้างสมุดทุกเล่ม (เครื่องส่วนกลาง)', onClick: () => {\n            confirmBox.replaceChildren(h('div', { class: 'panel' }, h('div', { text: 'ล้างสมุด เหรียญ และชื่อเรียกทั้งหมดบนเครื่องนี้ ใช่หรือไม่?' }),\n              h('div', { class: 'row' }, h('button', { class: 'btn pri', text: 'ใช่ ล้างทั้งหมด', onClick: () => { const p = E.resetProfile(); Object.assign(profile, p); toast('ล้างข้อมูลแล้ว'); collectionView(); } }),\n                h('button', { class: 'btn', text: 'ไม่ล้าง', onClick: () => confirmBox.replaceChildren() }))));\n          },\n        })),\n      confirmBox));\n  }\n\n  // ---------------------------------------------------------------- shop\n  function shopView() {\n    state.view = 'shop';\n    clearInterval(timer);\n    const row = (it, buyable) => {\n      const owned = profile.cosmetics.owned.includes(it.id);\n      const eq = profile.cosmetics.equipped[it.type] === it.id;\n      return h('div', { class: 'shop' },\n        h('div', { class: 'nm' }, h('div', { text: it.nameTh }), h('div', { text: `${E.COSMETIC_TYPES[it.type]}${buyable && !owned ? ' · ' + it.price + ' เหรียญ' : ''}${owned ? ' · เป็นเจ้าของแล้ว' : ''}` })),\n        owned ? h('button', { class: 'btn' + (eq ? ' on' : ''), onClick: () => { E.equipCosmetic(profile, it.id); shopView(); }, text: eq ? 'สวมอยู่ · ถอด' : 'สวมใส่' })\n          : buyable ? h('button', { class: 'btn pri', disabled: profile.coins < it.price, onClick: () => { const r = E.buyCosmetic(profile, it.id); toast(r.ok ? 'ซื้อแล้ว' : 'ซื้อไม่ได้'); shopView(); }, text: 'ซื้อ' })\n            : h('span', { text: 'ยังไม่ได้รับ' }));\n    };\n    const ownedExtra = [...E.REWARDS, ...E.WEEKLY_HATS].filter((r) => profile.cosmetics.owned.includes(r.id));\n    root.replaceChildren(h('div', { class: 'wrap' },\n      h('h2', { text: 'ร้านค้าตกแต่ง' }),\n      h('div', { class: 'panel', text: `เหรียญของคุณ ${profile.coins} เหรียญ (ตกแต่งอย่างเดียว ไม่มีผลต่อคะแนน)` }),\n      h('div', { class: 'panel' }, ...E.SHOP.map((it) => row(it, true))),\n      ownedExtra.length ? h('div', { class: 'panel' }, h('h3', { text: 'ของรางวัลที่ได้รับ' }), ...ownedExtra.map((it) => row(it, false))) : null,\n      h('div', { class: 'row' }, h('button', { class: 'btn', onClick: async () => { mainView(); await redraw(); }, text: 'กลับ' }))));\n  }\n\n  // ---------------------------------------------------------------- reveal animation\n  async function reveal() {\n    const steps = [outcome.persona, ...outcome.badges];\n    const ov = h('div', { class: 'reveal', role: 'dialog', 'aria-label': 'ผลฉายา' });\n    const skip = h('button', { class: 'btn', text: 'ข้าม', onClick: () => finish() });\n    let done = false;\n    const finish = () => { if (done) return; done = true; ov.remove(); };\n    root.append(ov);\n    ov.append(h('div', { class: 'sub', text: 'ฉายาของคุณคือ...' }));\n    const name = h('div', { class: 'big pop', text: outcome.persona.nameTh });\n    const subl = h('div', { class: 'sub', text: outcome.persona.subTh });\n    ov.append(name, subl);\n    const bw = h('div', { class: 'row', style: 'justify-content:center' });\n    ov.append(bw, skip);\n    const wait = (ms) => new Promise((r) => setTimeout(r, reduced() ? 0 : ms));\n    await wait(900);\n    for (const b of steps.slice(1)) { if (done) return; bw.append(h('span', { class: 'bdg pop', text: b.nameTh })); await wait(600); }\n    await wait(900);\n    finish();\n  }\n\n  await redraw();\n  mainView();\n  if (!reduced()) reveal();\n  if (commit.milestones && commit.milestones.length) toast('ได้ของรางวัลสะสม: ' + commit.milestones.map((m) => m.nameTh).join(', '));\n  if (commit.weeklyHat) toast('ครบ 5 แสตมป์ รับ ' + commit.weeklyHat.nameTh);\n\n  return {\n    outcome, profile,\n    destroy() { destroyed = true; clearInterval(timer); root.remove(); },\n  };\n}\n\nObject.defineProperty(__exp, \"showShareScreen\", { enumerable: true, get: () => showShareScreen });";
