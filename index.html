@@ -62,6 +62,7 @@ const { loadConsentCopy, initConsent, consent, allows } = __req("src/core/consen
 const { consentScreen } = __req("src/ui/consent.js");
 const telemetry = __req("src/core/telemetry.js");
 const trace = __req("src/core/trace.js");
+const { startTicket } = __req("src/metrics/trust.js");
 const { dailyStampOnLaunch } = __req("src/ui/daily_stamp.js");
 const { installResumeButtons } = __req("src/ui/title_resume.js");
 const { warmGlyphs } = __req("src/ui/warm.js");
@@ -157,6 +158,7 @@ function startRun(cp = null) {
   const forcedMap = plan && plan.map ? plan.map : mm ? getMap(mm[0].toUpperCase(), mm.endsWith('m')) : null;
   stopGame();
   const replay = canSkipLesson();
+  startTicket(); // the run is starting: the server stamps it (a report must come back with this ticket and cannot be younger than the run)
   if (!cp) bumpAttempts(); // a resumed run is the same attempt
   hud = createHud({
     sprites, settings, audio, params: { canSkipTutorial: replay },
@@ -28616,7 +28618,7 @@ Object.defineProperty(__exp, "STARS_CSS", { enumerable: true, get: () => STARS_C
 __defs["src/core/version.js"] = function(__exp, __req, __dyn) {
 // Build stamp shown on the title screen (and in <html data-build>) so anyone can tell which build they are playing.
 // `node tools/build.mjs` replaces the value with 'YYYY-MM-DD HH:mm · <git short hash>'; the dev server shows 'dev'.
-const BUILD = "2026-10-29 19:54 · 2663019";
+const BUILD = "2026-10-30 09:43 · 41d283d";
 
 Object.defineProperty(__exp, "BUILD", { enumerable: true, get: () => BUILD });
 };
@@ -28651,6 +28653,7 @@ __defs["src/metrics/report.js"] = function(__exp, __req, __dyn) {
 // Browser glue for the ref code: generate at the end of a run, build the payload, hand it to the upload queue.
 const { generateRef, formatRef } = __req("src/metrics/refcode.js");
 const { buildPayload } = __req("src/metrics/payload.js");
+const { attachTrust, currentTicket } = __req("src/metrics/trust.js");
 const { createUploader } = __req("src/metrics/uploader.js");
 const { getEndpoint } = __req("src/metrics/config.js");
 const { consent, canUpload } = __req("src/core/consent_store.js");
@@ -28687,7 +28690,7 @@ function env() {
 function updateReportStars(result) {
   const rep = result && result.report;
   if (!rep || !rep.ctx) return null;
-  const payload = buildPayload(result, rep.ctx);
+  const payload = attachTrust(buildPayload(result, rep.ctx), rep.ticket);
   rep.payload = payload;
   uploader().enqueue(payload);
   return payload;
@@ -28702,12 +28705,13 @@ function reportRun(result, { attempt } = {}) {
   if (!canUpload()) { result.notSent = true; result.ref = ''; result.report = null; return null; }
   const flags = consent().flags();
   const ref = generateRef();
-  const payload = buildPayload(result, {
+  const tk = currentTicket();
+  const payload = attachTrust(buildPayload(result, {
     ref, attempt, resumed: result.resumed, resumeCount: result.resumeCount, pauseSec: result.pauseSec, ffSec: result.ffSec, env: env(), consent: flags,
-  });
+  }), tk);
   const u = uploader();
   u.enqueue(payload);
-  const rep = { ref, display: formatRef(ref), payload, ctx: { ref, attempt, resumed: result.resumed, resumeCount: result.resumeCount, pauseSec: result.pauseSec, ffSec: result.ffSec, env: env(), consent: flags, ts: Date.now() }, status: () => u.status(ref), subscribe: (f) => u.subscribe((r, s) => { if (r === ref) f(s); }), retry: () => u.flush({ force: true }) };
+  const rep = { ref, display: formatRef(ref), payload, ticket: tk, ctx: { ref, attempt, resumed: result.resumed, resumeCount: result.resumeCount, pauseSec: result.pauseSec, ffSec: result.ffSec, env: env(), consent: flags, ts: Date.now() }, status: () => u.status(ref), subscribe: (f) => u.subscribe((r, s) => { if (r === ref) f(s); }), retry: () => u.flush({ force: true }) };
   result.ref = ref;
   result.report = rep;
   return rep;
@@ -28847,6 +28851,202 @@ function redactCode(code, choices) {
 
 Object.defineProperty(__exp, "coarseUa", { enumerable: true, get: () => coarseUa });
 Object.defineProperty(__exp, "redactCode", { enumerable: true, get: () => redactCode });
+};
+__defs["src/metrics/trust.js"] = function(__exp, __req, __dyn) {
+// Run ticket + report signature (server side: apps-script/Code.gs trustOf_).  A made-up POST cannot know (a) a ticket the server made when the run began, and its age,
+// (b) the signature of a real game build.  Neither is a lock a determined person with the bundle cannot pick; together with the plausibility checks on the server they
+// make forging a result cost real effort and leave a trail (trust = review in the sheet).  Never throws, never blocks play.
+const { getEndpoint } = __req("src/metrics/config.js");
+const { SECRET } = __req("src/core/secret.js");
+const { hmacSha256, utf8, sign } = __req("src/core/sealed.js");
+
+let ticket = null;
+
+/** the text that is signed: what the server re-builds from the payload */
+const sigText = (p) => [p.ref, p.long || '', p.tk || '', p.tt || 0].join('|');
+
+/** a run begins: ask the server for a ticket (fire and forget; a missing ticket only marks the report 'review') */
+function startTicket() {
+  ticket = null;
+  try {
+    const url = getEndpoint();
+    if (!url || typeof fetch !== 'function') return;
+    fetch(url + (url.includes('?') ? '&' : '?') + 'action=start', { method: 'GET' })
+      .then((r) => r.json()).then((j) => { if (j && j.ok && j.tk) ticket = { tk: j.tk, tt: j.t, tsig: j.sig }; }).catch(() => {});
+  } catch (e) { /* offline: no ticket */ }
+}
+const currentTicket = () => ticket;
+
+/**
+ * add ticket + signature to a payload (mutates and returns it).  The signing key is derived from the REF CODE (HMAC(SECRET, 'rep|' + ref)), not from the install:
+ * it proves "a game build made this", and carries no persistent id of the player (the report is in the required consent group; only the opt-in trace has the install id).
+ */
+function attachTrust(p, tk = ticket) {
+  try {
+    const t = tk || {};
+    p.tk = t.tk || ''; p.tt = t.tt || 0; p.tsig = t.tsig || '';
+    p.sig = sign(hmacSha256(utf8(String(SECRET)), 'rep|' + p.ref), sigText(p));
+  } catch (e) { /* unsigned */ }
+  return p;
+}
+
+Object.defineProperty(__exp, "startTicket", { enumerable: true, get: () => startTicket });
+Object.defineProperty(__exp, "attachTrust", { enumerable: true, get: () => attachTrust });
+Object.defineProperty(__exp, "sigText", { enumerable: true, get: () => sigText });
+Object.defineProperty(__exp, "currentTicket", { enumerable: true, get: () => currentTicket });
+};
+__defs["src/core/secret.js"] = function(__exp, __req, __dyn) {
+// The game <-> server shared secret.  `node tools/build.mjs` replaces the value with the one in tools/.secret (git-ignored, made on the first build;
+// the same text goes into the Apps Script property TRACE_KEY, see apps-script/README.md).  The checked-in value is only for local development.
+const SECRET = "E3bXY6p0YEQUw8w1Sl_Y1G71YzC5dixl";
+
+Object.defineProperty(__exp, "SECRET", { enumerable: true, get: () => SECRET });
+};
+__defs["src/core/sealed.js"] = function(__exp, __req, __dyn) {
+// Synchronous authenticated encryption for everything this game keeps on the device (and the signature the server checks).
+//   sha256 / hmacSha256 (RFC 6234 / 2104), chacha20 (RFC 8439), seal / open = ChaCha20 + HMAC-SHA256 (encrypt-then-MAC, 128-bit tag).
+// Sync on purpose: the game reads and writes localStorage synchronously in ~20 places; WebCrypto is async-only.
+// What it gives: nobody can read OR edit a stored value without the key; a flipped bit = rejected.  What no client-side scheme can give: the key has
+// to sit inside the game for the game to read its own save, so a determined owner of the device who reverse-engineers the bundle can get it.  The server
+// therefore never trusts the stored values: it re-derives the same key (src/core/secure_store.js 'sign') and rejects what does not verify.
+const K = new Uint32Array([
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+]);
+const rotr = (x, n) => (x >>> n) | (x << (32 - n));
+
+function utf8(s) { return typeof s === 'string' ? new TextEncoder().encode(s) : s; }
+
+function sha256(msg) {
+  const m = utf8(msg);
+  const h = new Uint32Array([0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]);
+  const n = m.length, padLen = ((n + 9 + 63) >> 6) << 6;
+  const b = new Uint8Array(padLen);
+  b.set(m); b[n] = 0x80;
+  const dv = new DataView(b.buffer);
+  dv.setUint32(padLen - 8, Math.floor((n * 8) / 4294967296), false);
+  dv.setUint32(padLen - 4, (n * 8) >>> 0, false);
+  const w = new Uint32Array(64);
+  for (let o = 0; o < padLen; o += 64) {
+    for (let i = 0; i < 16; i++) w[i] = dv.getUint32(o + i * 4, false);
+    for (let i = 16; i < 64; i++) {
+      const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3), s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) | 0;
+    }
+    let a = h[0], bb = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+    for (let i = 0; i < 64; i++) {
+      const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25), ch = (e & f) ^ (~e & g), t1 = (hh + S1 + ch + K[i] + w[i]) | 0;
+      const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22), mj = (a & bb) ^ (a & c) ^ (bb & c), t2 = (S0 + mj) | 0;
+      hh = g; g = f; f = e; e = (d + t1) | 0; d = c; c = bb; bb = a; a = (t1 + t2) | 0;
+    }
+    h[0] += a; h[1] += bb; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+  }
+  const out = new Uint8Array(32), ov = new DataView(out.buffer);
+  for (let i = 0; i < 8; i++) ov.setUint32(i * 4, h[i], false);
+  return out;
+}
+
+function concat(...parts) {
+  let n = 0; for (const p of parts) n += p.length;
+  const o = new Uint8Array(n); let k = 0;
+  for (const p of parts) { o.set(p, k); k += p.length; }
+  return o;
+}
+
+function hmacSha256(key, msg) {
+  let k = utf8(key);
+  if (k.length > 64) k = sha256(k);
+  const ip = new Uint8Array(64).fill(0x36), op = new Uint8Array(64).fill(0x5c);
+  for (let i = 0; i < k.length; i++) { ip[i] ^= k[i]; op[i] ^= k[i]; }
+  return sha256(concat(op, sha256(concat(ip, utf8(msg)))));
+}
+
+/** ChaCha20 (RFC 8439): key 32 bytes, nonce 12 bytes, 32-bit block counter */
+function chacha20(key, nonce, data, counter = 1) {
+  const st = new Uint32Array(16), x = new Uint32Array(16), out = new Uint8Array(data.length);
+  const kv = new DataView(key.buffer, key.byteOffset, 32), nv = new DataView(nonce.buffer, nonce.byteOffset, 12);
+  st[0] = 0x61707865; st[1] = 0x3320646e; st[2] = 0x79622d32; st[3] = 0x6b206574;
+  for (let i = 0; i < 8; i++) st[4 + i] = kv.getUint32(i * 4, true);
+  for (let i = 0; i < 3; i++) st[13 + i] = nv.getUint32(i * 4, true);
+  const qr = (a, b, c, d) => {
+    x[a] += x[b]; x[d] = ((x[d] ^ x[a]) << 16) | ((x[d] ^ x[a]) >>> 16);
+    x[c] += x[d]; x[b] = ((x[b] ^ x[c]) << 12) | ((x[b] ^ x[c]) >>> 20);
+    x[a] += x[b]; x[d] = ((x[d] ^ x[a]) << 8) | ((x[d] ^ x[a]) >>> 24);
+    x[c] += x[d]; x[b] = ((x[b] ^ x[c]) << 7) | ((x[b] ^ x[c]) >>> 25);
+  };
+  for (let off = 0; off < data.length; off += 64, counter++) {
+    st[12] = counter >>> 0;
+    x.set(st);
+    for (let r = 0; r < 10; r++) { qr(0, 4, 8, 12); qr(1, 5, 9, 13); qr(2, 6, 10, 14); qr(3, 7, 11, 15); qr(0, 5, 10, 15); qr(1, 6, 11, 12); qr(2, 7, 8, 13); qr(3, 4, 9, 14); }
+    const end = Math.min(64, data.length - off);
+    for (let i = 0; i < end; i++) { const word = (x[i >> 2] + st[i >> 2]) >>> 0; out[off + i] = data[off + i] ^ ((word >>> ((i & 3) * 8)) & 255); }
+  }
+  return out;
+}
+
+function randomBytes(n) {
+  const a = new Uint8Array(n);
+  try { globalThis.crypto.getRandomValues(a); } catch (e) { for (let i = 0; i < n; i++) a[i] = Math.floor(Math.random() * 256); }
+  return a;
+}
+
+const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+function b64(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i += 3) {
+    const n = (bytes[i] << 16) | ((bytes[i + 1] || 0) << 8) | (bytes[i + 2] || 0);
+    s += B64[(n >> 18) & 63] + B64[(n >> 12) & 63] + (i + 1 < bytes.length ? B64[(n >> 6) & 63] : '') + (i + 2 < bytes.length ? B64[n & 63] : '');
+  }
+  return s;
+}
+function unb64(s) {
+  const out = [];
+  let acc = 0, bits = 0;
+  for (const ch of s) {
+    const v = B64.indexOf(ch);
+    if (v < 0) return null;
+    acc = (acc << 6) | v; bits += 6;
+    if (bits >= 8) { bits -= 8; out.push((acc >> bits) & 255); acc &= (1 << bits) - 1; }
+  }
+  return Uint8Array.from(out);
+}
+const hex = (b) => Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
+
+const ctEq = (a, b) => { if (a.length !== b.length) return false; let d = 0; for (let i = 0; i < a.length; i++) d |= a[i] ^ b[i]; return d === 0; };
+
+/** key (32 bytes) + context string (bound into the tag: a value cannot be moved under another name) -> base64url text */
+function seal(key, context, plaintext, nonce = randomBytes(12)) {
+  const ek = hmacSha256(key, 'enc'), mk = hmacSha256(key, 'mac');
+  const ct = chacha20(ek, nonce, utf8(plaintext));
+  const tag = hmacSha256(mk, concat(utf8(context + '\0'), nonce, ct)).subarray(0, 16);
+  return b64(concat(nonce, ct, tag));
+}
+/** -> plaintext string, or null when the text was altered / made for another key or name */
+function open(key, context, text) {
+  const raw = unb64(String(text));
+  if (!raw || raw.length < 28) return null;
+  const nonce = raw.subarray(0, 12), ct = raw.subarray(12, raw.length - 16), tag = raw.subarray(raw.length - 16);
+  const ek = hmacSha256(key, 'enc'), mk = hmacSha256(key, 'mac');
+  if (!ctEq(hmacSha256(mk, concat(utf8(context + '\0'), nonce, ct)).subarray(0, 16), tag)) return null;
+  try { return new TextDecoder().decode(chacha20(ek, nonce, ct)); } catch (e) { return null; }
+}
+/** detached signature (hex, 128 bit) of a text under a key: what the server re-computes */
+const sign = (key, text) => hex(hmacSha256(key, text).subarray(0, 16));
+
+Object.defineProperty(__exp, "utf8", { enumerable: true, get: () => utf8 });
+Object.defineProperty(__exp, "sha256", { enumerable: true, get: () => sha256 });
+Object.defineProperty(__exp, "concat", { enumerable: true, get: () => concat });
+Object.defineProperty(__exp, "hmacSha256", { enumerable: true, get: () => hmacSha256 });
+Object.defineProperty(__exp, "chacha20", { enumerable: true, get: () => chacha20 });
+Object.defineProperty(__exp, "randomBytes", { enumerable: true, get: () => randomBytes });
+Object.defineProperty(__exp, "b64", { enumerable: true, get: () => b64 });
+Object.defineProperty(__exp, "unb64", { enumerable: true, get: () => unb64 });
+Object.defineProperty(__exp, "seal", { enumerable: true, get: () => seal });
+Object.defineProperty(__exp, "open", { enumerable: true, get: () => open });
+Object.defineProperty(__exp, "hex", { enumerable: true, get: () => hex });
+Object.defineProperty(__exp, "sign", { enumerable: true, get: () => sign });
 };
 __defs["src/metrics/uploader.js"] = function(__exp, __req, __dyn) {
 // Upload queue for run reports (docs/CODES.md section 1).  Pure logic with injected fetch / storage / clock, so it is unit-testable.
@@ -37292,13 +37492,6 @@ const secure = typeof window !== 'undefined' ? installSecureStorage(window, SECR
 
 Object.defineProperty(__exp, "secure", { enumerable: true, get: () => secure });
 };
-__defs["src/core/secret.js"] = function(__exp, __req, __dyn) {
-// The game <-> server shared secret.  `node tools/build.mjs` replaces the value with the one in tools/.secret (git-ignored, made on the first build;
-// the same text goes into the Apps Script property TRACE_KEY, see apps-script/README.md).  The checked-in value is only for local development.
-const SECRET = "E3bXY6p0YEQUw8w1Sl_Y1G71YzC5dixl";
-
-Object.defineProperty(__exp, "SECRET", { enumerable: true, get: () => SECRET });
-};
 __defs["src/core/secure_store.js"] = function(__exp, __req, __dyn) {
 // Transparent encryption of every localStorage key of the game (names starting 'tpdv' / 'tp_'): the 20-odd call sites keep using localStorage as before,
 // they just get / put plain text while the disk (and the dev tools Application tab) only ever holds 'e1.<sealed>' (src/core/sealed.js).
@@ -37373,152 +37566,6 @@ function installSecureStorage(win, secret, devOk) {
 
 Object.defineProperty(__exp, "createSecureStorage", { enumerable: true, get: () => createSecureStorage });
 Object.defineProperty(__exp, "installSecureStorage", { enumerable: true, get: () => installSecureStorage });
-};
-__defs["src/core/sealed.js"] = function(__exp, __req, __dyn) {
-// Synchronous authenticated encryption for everything this game keeps on the device (and the signature the server checks).
-//   sha256 / hmacSha256 (RFC 6234 / 2104), chacha20 (RFC 8439), seal / open = ChaCha20 + HMAC-SHA256 (encrypt-then-MAC, 128-bit tag).
-// Sync on purpose: the game reads and writes localStorage synchronously in ~20 places; WebCrypto is async-only.
-// What it gives: nobody can read OR edit a stored value without the key; a flipped bit = rejected.  What no client-side scheme can give: the key has
-// to sit inside the game for the game to read its own save, so a determined owner of the device who reverse-engineers the bundle can get it.  The server
-// therefore never trusts the stored values: it re-derives the same key (src/core/secure_store.js 'sign') and rejects what does not verify.
-const K = new Uint32Array([
-  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
-]);
-const rotr = (x, n) => (x >>> n) | (x << (32 - n));
-
-function utf8(s) { return typeof s === 'string' ? new TextEncoder().encode(s) : s; }
-
-function sha256(msg) {
-  const m = utf8(msg);
-  const h = new Uint32Array([0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]);
-  const n = m.length, padLen = ((n + 9 + 63) >> 6) << 6;
-  const b = new Uint8Array(padLen);
-  b.set(m); b[n] = 0x80;
-  const dv = new DataView(b.buffer);
-  dv.setUint32(padLen - 8, Math.floor((n * 8) / 4294967296), false);
-  dv.setUint32(padLen - 4, (n * 8) >>> 0, false);
-  const w = new Uint32Array(64);
-  for (let o = 0; o < padLen; o += 64) {
-    for (let i = 0; i < 16; i++) w[i] = dv.getUint32(o + i * 4, false);
-    for (let i = 16; i < 64; i++) {
-      const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3), s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
-      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) | 0;
-    }
-    let a = h[0], bb = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
-    for (let i = 0; i < 64; i++) {
-      const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25), ch = (e & f) ^ (~e & g), t1 = (hh + S1 + ch + K[i] + w[i]) | 0;
-      const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22), mj = (a & bb) ^ (a & c) ^ (bb & c), t2 = (S0 + mj) | 0;
-      hh = g; g = f; f = e; e = (d + t1) | 0; d = c; c = bb; bb = a; a = (t1 + t2) | 0;
-    }
-    h[0] += a; h[1] += bb; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
-  }
-  const out = new Uint8Array(32), ov = new DataView(out.buffer);
-  for (let i = 0; i < 8; i++) ov.setUint32(i * 4, h[i], false);
-  return out;
-}
-
-function concat(...parts) {
-  let n = 0; for (const p of parts) n += p.length;
-  const o = new Uint8Array(n); let k = 0;
-  for (const p of parts) { o.set(p, k); k += p.length; }
-  return o;
-}
-
-function hmacSha256(key, msg) {
-  let k = utf8(key);
-  if (k.length > 64) k = sha256(k);
-  const ip = new Uint8Array(64).fill(0x36), op = new Uint8Array(64).fill(0x5c);
-  for (let i = 0; i < k.length; i++) { ip[i] ^= k[i]; op[i] ^= k[i]; }
-  return sha256(concat(op, sha256(concat(ip, utf8(msg)))));
-}
-
-/** ChaCha20 (RFC 8439): key 32 bytes, nonce 12 bytes, 32-bit block counter */
-function chacha20(key, nonce, data, counter = 1) {
-  const st = new Uint32Array(16), x = new Uint32Array(16), out = new Uint8Array(data.length);
-  const kv = new DataView(key.buffer, key.byteOffset, 32), nv = new DataView(nonce.buffer, nonce.byteOffset, 12);
-  st[0] = 0x61707865; st[1] = 0x3320646e; st[2] = 0x79622d32; st[3] = 0x6b206574;
-  for (let i = 0; i < 8; i++) st[4 + i] = kv.getUint32(i * 4, true);
-  for (let i = 0; i < 3; i++) st[13 + i] = nv.getUint32(i * 4, true);
-  const qr = (a, b, c, d) => {
-    x[a] += x[b]; x[d] = ((x[d] ^ x[a]) << 16) | ((x[d] ^ x[a]) >>> 16);
-    x[c] += x[d]; x[b] = ((x[b] ^ x[c]) << 12) | ((x[b] ^ x[c]) >>> 20);
-    x[a] += x[b]; x[d] = ((x[d] ^ x[a]) << 8) | ((x[d] ^ x[a]) >>> 24);
-    x[c] += x[d]; x[b] = ((x[b] ^ x[c]) << 7) | ((x[b] ^ x[c]) >>> 25);
-  };
-  for (let off = 0; off < data.length; off += 64, counter++) {
-    st[12] = counter >>> 0;
-    x.set(st);
-    for (let r = 0; r < 10; r++) { qr(0, 4, 8, 12); qr(1, 5, 9, 13); qr(2, 6, 10, 14); qr(3, 7, 11, 15); qr(0, 5, 10, 15); qr(1, 6, 11, 12); qr(2, 7, 8, 13); qr(3, 4, 9, 14); }
-    const end = Math.min(64, data.length - off);
-    for (let i = 0; i < end; i++) { const word = (x[i >> 2] + st[i >> 2]) >>> 0; out[off + i] = data[off + i] ^ ((word >>> ((i & 3) * 8)) & 255); }
-  }
-  return out;
-}
-
-function randomBytes(n) {
-  const a = new Uint8Array(n);
-  try { globalThis.crypto.getRandomValues(a); } catch (e) { for (let i = 0; i < n; i++) a[i] = Math.floor(Math.random() * 256); }
-  return a;
-}
-
-const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
-function b64(bytes) {
-  let s = '';
-  for (let i = 0; i < bytes.length; i += 3) {
-    const n = (bytes[i] << 16) | ((bytes[i + 1] || 0) << 8) | (bytes[i + 2] || 0);
-    s += B64[(n >> 18) & 63] + B64[(n >> 12) & 63] + (i + 1 < bytes.length ? B64[(n >> 6) & 63] : '') + (i + 2 < bytes.length ? B64[n & 63] : '');
-  }
-  return s;
-}
-function unb64(s) {
-  const out = [];
-  let acc = 0, bits = 0;
-  for (const ch of s) {
-    const v = B64.indexOf(ch);
-    if (v < 0) return null;
-    acc = (acc << 6) | v; bits += 6;
-    if (bits >= 8) { bits -= 8; out.push((acc >> bits) & 255); acc &= (1 << bits) - 1; }
-  }
-  return Uint8Array.from(out);
-}
-const hex = (b) => Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
-
-const ctEq = (a, b) => { if (a.length !== b.length) return false; let d = 0; for (let i = 0; i < a.length; i++) d |= a[i] ^ b[i]; return d === 0; };
-
-/** key (32 bytes) + context string (bound into the tag: a value cannot be moved under another name) -> base64url text */
-function seal(key, context, plaintext, nonce = randomBytes(12)) {
-  const ek = hmacSha256(key, 'enc'), mk = hmacSha256(key, 'mac');
-  const ct = chacha20(ek, nonce, utf8(plaintext));
-  const tag = hmacSha256(mk, concat(utf8(context + '\0'), nonce, ct)).subarray(0, 16);
-  return b64(concat(nonce, ct, tag));
-}
-/** -> plaintext string, or null when the text was altered / made for another key or name */
-function open(key, context, text) {
-  const raw = unb64(String(text));
-  if (!raw || raw.length < 28) return null;
-  const nonce = raw.subarray(0, 12), ct = raw.subarray(12, raw.length - 16), tag = raw.subarray(raw.length - 16);
-  const ek = hmacSha256(key, 'enc'), mk = hmacSha256(key, 'mac');
-  if (!ctEq(hmacSha256(mk, concat(utf8(context + '\0'), nonce, ct)).subarray(0, 16), tag)) return null;
-  try { return new TextDecoder().decode(chacha20(ek, nonce, ct)); } catch (e) { return null; }
-}
-/** detached signature (hex, 128 bit) of a text under a key: what the server re-computes */
-const sign = (key, text) => hex(hmacSha256(key, text).subarray(0, 16));
-
-Object.defineProperty(__exp, "utf8", { enumerable: true, get: () => utf8 });
-Object.defineProperty(__exp, "sha256", { enumerable: true, get: () => sha256 });
-Object.defineProperty(__exp, "concat", { enumerable: true, get: () => concat });
-Object.defineProperty(__exp, "hmacSha256", { enumerable: true, get: () => hmacSha256 });
-Object.defineProperty(__exp, "chacha20", { enumerable: true, get: () => chacha20 });
-Object.defineProperty(__exp, "randomBytes", { enumerable: true, get: () => randomBytes });
-Object.defineProperty(__exp, "b64", { enumerable: true, get: () => b64 });
-Object.defineProperty(__exp, "unb64", { enumerable: true, get: () => unb64 });
-Object.defineProperty(__exp, "seal", { enumerable: true, get: () => seal });
-Object.defineProperty(__exp, "open", { enumerable: true, get: () => open });
-Object.defineProperty(__exp, "hex", { enumerable: true, get: () => hex });
-Object.defineProperty(__exp, "sign", { enumerable: true, get: () => sign });
 };
 __lazy["src/core/audit.js"] = "\"use strict\";\n// Game audit manager: watches a running director and reports anything that breaks the rules of a run.  Pure (no DOM, no storage); the director never depends on it.\n//   const audit = createAudit(director, { onIssue })      call  audit.before()  right before and  audit.tick(dtReal)  right AFTER every director.tick(dtReal)   (tests / tools/audit_run.mjs always; the game with ?audit=1)\n//   audit.issues                     [{ code, sev: 'error'|'warn', t (run clock), msg, data }]  (each code at most 3 times per run)\n//   audit.summary()                  { errors, warns, byCode, waves: [{ no, planned, left, alive, cut, wall, budget }] }\n// Rules (docs/AUDIT.md):\n//   spawn_stall        due enemies of the wave did not spawn for 18 s of sim time although the alive cap is not the reason\n//   cap_stall          the alive cap blocks spawns for 60 s of sim time (nothing alive gets killed)\n//   clear_not_ended    every enemy of the wave is dead and spawned, yet the wave goes on for > rest + 4 s of run clock\n//   only_usb_left      only a USB stick is left for > 25 s: the wave waits for it\n//   wave_cut           a wave ended by its time budget with enemies unspawned / alive (the player did not get to finish it)\n//   wave_overrun       a wave's wall time went > 20 s past its budget (the 12 s grace for enemies still walking is allowed)\n//   clock_policy       the run clock / sim time did not follow the pause / hold / event rule of that state\n//   no_wave_enemies    a wave's plan is empty (nothing would ever come)\n//   boss_missing       the boss state started without a boss in the plan / sim\nfunction createAudit(D, { onIssue } = {}) {\n  const A = { issues: [], waves: [] };\n  const seen = {};\n  const add = (code, sev, msg, data) => {\n    seen[code] = (seen[code] || 0) + 1;\n    if (seen[code] > 3) return;\n    const it = { code, sev, t: +D.clock.toFixed(1), msg, data: data || {} };\n    A.issues.push(it);\n    if (onIssue) { try { onIssue(it); } catch (e) { /* observer only */ } }\n  };\n  let prev = null; // { clock, simT, state, sim }\n  let lastProgress = 0, lastDone = -1, capSince = 0, clearedFor = 0, usbOnlyFor = 0;\n  let curWave = null, snap = null;\n\n  function waveSnapshot() {\n    const sim = D.sim, w = sim && sim.wave;\n    if (!w) return null;\n    let planLeft = 0;\n    for (const p of w.plan) if (!p.done) planLeft++;\n    return { no: w.no, planned: w.size, planLeft, spawnedAll: w.spawnedAll, alive: sim.enemies.filter((e) => !e.dead && e.type !== 'usb').length, elites: sim.enemies.filter((e) => !e.dead && (e.type === 'ransom' || e.type === 'goblin' || e.type === 'meetbot')).length, wallT: D.wave ? D.wave.wallT : 0, budget: D.wave ? D.wave.budget : 0 };\n  }\n\n  // call right BEFORE director.tick(dt): the state may legitimately change between two ticks (an event's continuation runs between them)\n  A.before = () => { prev = { clock: D.clock, simT: D.sim ? D.sim.t : 0, state: D.state, sim: D.sim }; };\n\n  A.tick = (dt) => {\n    const sim = D.sim;\n    const cur = { clock: D.clock, simT: sim ? sim.t : 0, state: D.state, sim };\n    // ---- clock policy (only when state and sim did not change inside the tick) ----\n    if (prev && prev.sim === sim && prev.state === D.state && sim && !D.finished) {\n      const dClock = cur.clock - prev.clock, dSim = cur.simT - prev.simT;\n      const frozen = D.paused || D.evPaused || D.hold || D.holdExt;\n      const dtEff = Math.min(D.paused || D.state === 'event' ? 5 : 0.25, Math.max(0, dt));\n      const bad = (what) => add('clock_policy', 'error', what, { state: D.state, dt: +dt.toFixed(3), dClock: +dClock.toFixed(3), dSim: +dSim.toFixed(3), speed: D.speed, slowmo: D.slowmo, paused: !!D.paused, evPaused: !!D.evPaused, hold: !!D.hold, holdExt: !!D.holdExt, tdRun: !!D._evTd });\n      if (D.state === 'briefing' || D.state === 'idle' || D.state === 'done' || D.state === 'endreview') { /* not a running state */ }\n      else if (frozen) { if (dClock > 1e-6 || dSim > 1e-6) bad('time advanced while paused / held'); }\n      else {\n        if (Math.abs(dClock - dtEff) > 1e-3) bad('run clock did not advance by dt');\n        if (D.state === 'event') {\n          if (D._evTd) { if (dSim > dtEff * 1.01 + 1e-6) bad('TD behind a question ran faster than x1'); }\n          else if (dSim > 1e-6) bad('TD moved behind a question that should freeze it');\n        } else if (D.state === 'wave' || D.state === 'boss') {\n          const want = dtEff * D.speed * D.slowmo;\n          if (Math.abs(dSim - want) > 0.011 + want * 0.02) bad('sim time did not follow dt x speed x slow-mo');\n        }\n      }\n    }\n    prev = null;\n    if (!sim || D.finished) return;\n    // ---- waves ----\n    const w = sim.wave;\n    const dw = D.wave;\n    if (dw !== curWave) { // a wave ended (or began): judge the one that just ended from the last snapshot\n      if (curWave && snap) {\n        const le = D.lastWaveEnd && D.lastWaveEnd.no === snap.no ? D.lastWaveEnd : null;\n        const cut = !!le && le.reason === 'budget' && (le.planLeft > 0 || le.alive > 0);\n        A.waves.push({ no: snap.no, planned: snap.planned, left: le ? le.planLeft : snap.planLeft, alive: le ? le.alive : snap.alive, cut, reason: le ? le.reason : '?', wall: +snap.wallT.toFixed(1), budget: +snap.budget.toFixed(1) });\n        if (cut) add('wave_cut', 'warn', `wave ${snap.no} ended by its time budget with ${le.planLeft} unspawned and ${le.alive} alive`, le);\n        if (snap.wallT > snap.budget + 20) add('wave_overrun', 'error', `wave ${snap.no} ran ${(snap.wallT - snap.budget).toFixed(1)} s past its budget (grace is 12 s)`, snap);\n      }\n      curWave = dw; snap = null; lastProgress = 0; lastDone = -1; capSince = 0; clearedFor = 0; usbOnlyFor = 0;\n      if (dw && w && w.size === 0 && w.no !== 0) add('no_wave_enemies', 'error', `wave ${w.no} has an empty plan`, { no: w.no });\n    }\n    if (D.state === 'boss' && w && !w.plan.some((p) => p.type === 'hydra')) add('boss_missing', 'error', 'boss state without a boss in the plan', {});\n    if ((D.state === 'wave' || D.state === 'boss') && w && !D.paused && !D.hold && !D.holdExt && !D.evPaused) {\n      snap = waveSnapshot();\n      const done = w.plan.reduce((a, p) => a + (p.done ? 1 : 0), 0);\n      if (done !== lastDone) { lastDone = done; lastProgress = sim.t; capSince = 0; }\n      let due = 0;\n      for (const p of w.plan) if (!p.done && p.at <= w.t) due++;\n      if (due > 0 && !w.spawnedAll) {\n        const alive = snap.alive;\n        const eliteDue = !!sim.fair && w.plan.some((p) => !p.done && p.at <= w.t && (p.type === 'ransom' || p.type === 'goblin' || p.type === 'meetbot' || p.type === 'hydra')) && snap.elites >= sim.fair.eliteCap;\n        if (alive >= sim.aliveCap || eliteDue) { lastProgress = sim.t; if (!capSince) capSince = sim.t; if (sim.t - capSince > 60) add('cap_stall', 'warn', 'the alive cap has blocked spawns for 60 s', { alive, cap: sim.aliveCap, due }); }\n        else { capSince = 0; if (sim.t - lastProgress > 18) add('spawn_stall', 'error', `${due} due enemies did not spawn for ${(sim.t - lastProgress).toFixed(0)} s`, { due, alive, cap: sim.aliveCap, wave: w.no, pending: w.plan.filter((p) => !p.done).slice(0, 4).map((p) => ({ type: p.type, spawn: p.spawn, at: +p.at.toFixed(1), open: sim.openSpawn(p.spawn), path: !!(sim.grid.paths[p.spawn] && sim.grid.paths[p.spawn].length), guarded: !!p.guarded })), elites: sim.enemies.filter((q) => !q.dead).map((q) => q.type) }); }\n      } else if (!due) { lastProgress = sim.t; capSince = 0; }\n      if (D.waveCleared && D.state === 'wave') {\n        if (D.waveCleared()) { clearedFor += dt; if (clearedFor > Math.max(1.5, D.lp.fair ? D.lp.fair.restSec : 0) + 4) add('clear_not_ended', 'error', 'wave is cleared but did not end', { no: w.no, clearedFor: +clearedFor.toFixed(1) }); } else clearedFor = 0;\n      }\n      if (w.spawnedAll && sim.enemies.length > 0 && sim.enemies.every((e) => e.type === 'usb' || e.dead)) { usbOnlyFor += dt; if (usbOnlyFor > 25) add('only_usb_left', 'warn', 'only a USB stick is left; the wave waits for it', { no: w.no }); } else usbOnlyFor = 0;\n    }\n  };\n\n  A.summary = () => {\n    const byCode = {};\n    for (const i of A.issues) byCode[i.code] = (byCode[i.code] || 0) + 1;\n    return { errors: A.issues.filter((i) => i.sev === 'error').length, warns: A.issues.filter((i) => i.sev === 'warn').length, byCode, waves: A.waves.slice() };\n  };\n  return A;\n}\n\nObject.defineProperty(__exp, \"createAudit\", { enumerable: true, get: () => createAudit });";
 __lazy["src/share/ui.js"] = "\"use strict\";\n// Share screen UI (DOM). Entry point for the Core results screen:\n//   const h = await showShareScreen(container, { runResult, tdStats, meta, sprites?, bank?, onReplay?, onClose?, qr? })\n//   h.destroy()\n// Large touch targets (>= 48px), text >= 18px, Thai UI copy. Respects prefers-reduced-motion.\nconst E = __req(\"src/share/engine.js\");\nconst { loadShareBank, setShareBank } = __req(\"src/share/stats.js\");\nconst { buildGallery } = __req(\"src/share/gallery.js\");\nconst { renderCard, drawCard, canvasToBlob, loadArt, setArt, FORMATS, RARITY_STYLE } = __req(\"src/share/card.js\");\n\nconst CSS = `\n/* Share / collection / shop screens in the pixel house style: dark navy band, ink-outlined paper panels, nine-slice pixel buttons\n   (--ni-* from src/ui/chrome.js). Text is cream on the dark band and ink on paper (>= 4.5:1); no blur, no radii. */\n.tpsh{font-family:'Noto Sans Thai','Sarabun','Leelawadee UI',Tahoma,sans-serif;color:#f5f7fb;background-color:#13203a;background-image:linear-gradient(#0b1324d9,#0b1324d9),var(--floor-img,none);background-size:auto,48px 48px;min-height:100%;box-sizing:border-box;padding:12px;font-size:18px;line-height:1.5}\n.tpsh *{box-sizing:border-box}\n.tpsh h2{font-size:24px;margin:8px 0;color:#efe6d2;text-shadow:0 3px 0 #0e1628}.tpsh h3{font-size:20px;margin:6px 0}\n.tpsh .wrap>div:not(.panel)>h3,.tpsh .wrap>h3{color:#efe6d2}\n.tpsh .wrap{max-width:560px;margin:0 auto}\n.tpsh .btn{font:inherit;font-size:18px;font-weight:700;min-height:48px;min-width:48px;padding:6px 14px;border:4px solid transparent;border-image:var(--ni-blue) var(--ni-slice,4) fill/4px stretch;image-rendering:pixelated;border-radius:0;background:none;color:#fff;cursor:pointer;box-shadow:0 4px 0 0 #0e1628;text-shadow:0 2px 0 #0e162888}\n.tpsh .btn:active{transform:translateY(2px);box-shadow:0 2px 0 0 #0e1628}\n.tpsh .btn.pri{border-image-source:var(--ni-red)}.tpsh .btn.on{border-image-source:var(--ni-gold);color:#0e1628;text-shadow:none}.tpsh .btn:disabled{opacity:.5;cursor:default;box-shadow:none}\n.tpsh .btn:focus-visible,.tpsh textarea:focus-visible{outline:4px solid #2e7dd7;outline-offset:3px}\n.tpsh .row{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}.tpsh .row>.btn{flex:1 1 140px}\n.tpsh .card-box{text-align:center}.tpsh canvas{width:100%;height:auto;max-width:540px;border-radius:0;box-shadow:0 0 0 2px #0e1628,0 0 0 6px #efe6d2,0 0 0 8px #0e1628,0 12px 0 8px #0e1628;background:#14203a;display:block;margin:12px auto 22px}\n.tpsh textarea{width:100%;font:inherit;font-size:18px;min-height:110px;border:2px solid #0e1628;border-radius:0;padding:8px;background:#fbf7ee;color:#0e1628}\n.tpsh .panel{border:4px solid transparent;border-image:var(--ni-paper) var(--ni-slice,4) fill/4px stretch;image-rendering:pixelated;background:none;color:#0e1628;border-radius:0;padding:6px 10px;margin:10px 0 14px;box-shadow:0 4px 0 0 #0e1628}\n.tpsh .coins td{padding:2px 6px}.tpsh .coins td:last-child{text-align:right;font-weight:700}\n.tpsh .reveal{position:fixed;inset:0;z-index:50;background:#0b1324f2;color:#f5f7fb;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;text-align:center;padding:20px}\n.tpsh .reveal .big{font-size:36px;font-weight:800;color:#efe6d2;text-shadow:0 3px 0 #0e1628}.tpsh .reveal .sub{font-size:20px;color:#dbe6f7}\n.tpsh .pop{animation:tpshpop .5s steps(6) both}.tpsh.reduce .pop{animation:none}\n@keyframes tpshpop{0%{transform:scale(.3);opacity:0}70%{transform:scale(1.12);opacity:1}100%{transform:scale(1)}}\n.tpsh .bdg{background:#fbf7ee;color:#0e1628;border:2px solid #0e1628;border-radius:0;padding:8px 14px;font-weight:700;font-size:20px;margin:4px;box-shadow:0 3px 0 #0e1628}\n.tpsh .toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:#1b2a4a;color:#efe6d2;padding:12px 18px;border:2px solid #efe6d2;box-shadow:0 0 0 2px #0e1628,0 6px 0 2px #0e1628;border-radius:0;z-index:80;font-size:18px;max-width:90vw}\n.tpsh .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px}\n.tpsh .slot{border:3px dashed #8fb3e0;border-radius:0;padding:8px;background:#1b2a4a;color:#efe6d2;min-height:96px;font-size:18px}\n.tpsh .slot.got{border-style:solid;border-color:#0e1628;background:#fbf7ee;color:#0e1628;box-shadow:0 3px 0 #0e1628}.tpsh .slot.locked{background:#13203a;color:#c8d0e0}\n.tpsh .slot.cursed.got{border-color:#a8004f;background:#ffe9f3;color:#0e1628}\n.tpsh .stamps{display:flex;gap:6px}.tpsh .stamps span{flex:1;text-align:center;border:2px dashed #5b5b66;border-radius:0;padding:4px 0;font-size:18px}.tpsh .stamps span.on{background:#157a42;color:#fff;border:2px solid #0e1628}\n.tpsh .shop{display:flex;justify-content:space-between;align-items:center;gap:8px;border-bottom:2px dotted #c9b994;padding:8px 0}\n.tpsh .shop .nm{flex:1}\n.tpsh .savesheet{position:fixed;inset:0;z-index:70;background:#0b1324f2;color:#f5f7fb;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;padding:16px;text-align:center}\n.tpsh .savesheet img{max-width:min(90vw,420px);max-height:60vh;box-shadow:0 0 0 2px #0e1628,0 0 0 6px #efe6d2,0 0 0 8px #0e1628}\n`;\n\nconst TONE_TH = { good: 'สายดี', bad: 'สายตีกลับ', quirk: 'สายแปลกตา' };\nconst reduced = () => { try { return !!(globalThis.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches); } catch (e) { return false; } };\nconst h = (tag, attrs, ...kids) => {\n  const el = document.createElement(tag);\n  for (const [k, v] of Object.entries(attrs || {})) {\n    if (k === 'class') el.className = v;\n    else if (k === 'text') el.textContent = v;\n    else if (k.startsWith('on')) el.addEventListener(k.slice(2).toLowerCase(), v);\n    else if (v === true) el.setAttribute(k, '');\n    else if (v !== false && v != null) el.setAttribute(k, v);\n  }\n  for (const c of kids.flat()) if (c != null) el.append(c.nodeType ? c : document.createTextNode(c));\n  return el;\n};\n\nasync function showShareScreen(container, opts = {}) {\n  const { runResult, tdStats, meta = {}, sprites, bank, onReplay, onClose, qr } = opts;\n  if (!document.getElementById('tpsh-css')) { const st = h('style', { id: 'tpsh-css' }); st.textContent = CSS; document.head.append(st); }\n  await E.loadAchievements();\n  void sprites; // the share art (pixel pigeon + SVG frames/badges) is loaded by card.js itself\n  await loadArt().catch(() => {});\n  if (bank) setShareBank(bank); else if (!meta.bank && !globalThis.__TPDV_BANK__) { try { await loadShareBank(); } catch (e) { /* stats degrade gracefully */ } }\n\n  const profile = E.loadProfile();\n  // opening the share screen again for the same run must not pay coins / count the attempt twice\n  const memo = (globalThis.__tpshMemo ||= new Map());\n  const memoKey = runResult && runResult.code;\n  let outcome, commit;\n  if (memoKey && memo.has(memoKey)) ({ outcome, commit } = memo.get(memoKey));\n  else {\n    outcome = E.evaluateRun(runResult, tdStats, meta, { profile, considerate: profile.considerate, bank });\n    commit = E.commitRun(profile, outcome);\n    if (memoKey) memo.set(memoKey, { outcome, commit });\n  }\n  const state = { format: 'portrait', captionIdx: Math.floor(Math.random() * 3), caption: null, edited: false, view: 'main', t: 0 };\n\n  const root = h('div', { class: 'tpsh' + (reduced() ? ' reduce' : '') });\n  container.replaceChildren(root);\n  let timer = null, destroyed = false;\n  const toast = (msg) => { const t = h('div', { class: 'toast', role: 'status', text: msg }); root.append(t); setTimeout(() => t.remove(), 2600); };\n\n  // card art style: 'pixel' (default stamp / pixel-art look) or 'svg' (SVG frames; opt-in via opts.style or ?cardstyle=svg)\n  const cardStyle = opts.style || (typeof location !== 'undefined' && /[?&]cardstyle=svg/.test(location.search) ? 'svg' : 'pixel');\n  const model = () => ({\n    style: cardStyle, outcome, format: state.format, callsign: E.callsignText(profile),\n    cosmetics: { hat: profile.cosmetics.equipped.hat, frame: profile.cosmetics.equipped.frame, sticker: !!profile.cosmetics.equipped.sticker },\n    t: state.t, qr: qr || null,\n  });\n\n  const canvas = document.createElement('canvas');\n  canvas.setAttribute('role', 'img');\n  const redraw = async () => {\n    canvas.setAttribute('aria-label', `การ์ดฉายา ${outcome.persona.nameTh} ${outcome.stats.overall} คะแนน`);\n    await renderCard(model(), canvas);\n  };\n  const animate = () => {\n    clearInterval(timer);\n    if (reduced() || destroyed) return;\n    if (!['epic', 'legendary'].includes(outcome.rarity) && !(profile.cosmetics.equipped.frame)) return;\n    timer = setInterval(() => {\n      if (state.view !== 'main' || document.hidden || !canvas.isConnected) return;\n      state.t += 0.12;\n      drawCard(canvas.getContext('2d'), model());\n    }, 120);\n  };\n  const resetCaption = () => { state.caption = E.makeCaption(outcome, state.captionIdx); state.edited = false; };\n  resetCaption();\n\n  // ---------------------------------------------------------------- main view\n  function mainView() {\n    state.view = 'main';\n    const cap = h('textarea', { 'aria-label': 'ข้อความสำหรับโพสต์', onInput: (e) => { state.caption = e.target.value; state.edited = true; } });\n    cap.value = state.caption;\n    const refreshCap = () => { cap.value = state.caption; };\n    const hasCursed = [outcome.persona, ...outcome.badges, outcome.realPersona].some((a) => a && a.rarity === 'cursed');\n\n    const copyText = async (txt) => {\n      try { await navigator.clipboard.writeText(txt); return true; } catch (e) {\n        try { cap.select(); return document.execCommand('copy'); } catch (e2) { return false; }\n      }\n    };\n    // file name: data-vault-card-<persona-slug>.png|jpg (an extension always, even where the browser ignores the download attribute)\n    const slug = String((outcome.persona && (outcome.persona.id || outcome.persona.key)) || 'card').replace(/^p_/, '').replace(/[^a-z0-9]+/gi, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'card';\n    const fileBase = 'data-vault-card-' + slug;\n    const flatten = (src) => { const c = document.createElement('canvas'); c.width = src.width; c.height = src.height; const x = c.getContext('2d'); x.fillStyle = '#ffffff'; x.fillRect(0, 0, c.width, c.height); x.drawImage(src, 0, 0); return c; }; // JPG has no alpha\n    const makeBlob = async (type) => {\n      const jpg = type === 'image/jpeg';\n      const raw = await canvasToBlob(jpg ? flatten(canvas) : canvas, type, jpg ? 0.92 : undefined);\n      return new Blob([raw], { type }); // explicit MIME on the blob\n    };\n    const download = async (type = 'image/png') => {\n      const ext = type === 'image/jpeg' ? 'jpg' : 'png';\n      const blob = await makeBlob(type);\n      const url = URL.createObjectURL(blob);\n      const a = h('a', { href: url, download: fileBase + '.' + ext, type, rel: 'noopener' });\n      const noNamedDownload = !('download' in a) || /iPhone|iPad|iPod|FBAN|FBAV|Line\\/|Instagram|MicroMessenger/i.test(navigator.userAgent || '');\n      if (noNamedDownload) {\n        // in-app browsers / iOS save a blob link without its name: show the image so it can be saved with a long press\n        const sheet = h('div', { class: 'savesheet', role: 'dialog', 'aria-label': 'บันทึกรูป' }, h('img', { src: url, alt: 'การ์ดของคุณ' }),\n          h('div', { text: 'กดค้างที่รูป แล้วเลือก \"บันทึกรูปภาพ\"' }),\n          h('button', { class: 'btn', text: 'ปิด', onClick: () => { sheet.remove(); URL.revokeObjectURL(url); } }));\n        root.append(sheet);\n        return;\n      }\n      document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 4000);\n    };\n    const share = async () => {\n      let blob;\n      try { blob = await makeBlob('image/png'); } catch (e) { toast('สร้างรูปไม่สำเร็จ ลองกดดาวน์โหลดแทน'); return; }\n      const file = new File([blob], fileBase + '.png', { type: 'image/png' });\n      if (navigator.canShare && navigator.canShare({ files: [file] })) {\n        try { await navigator.share({ files: [file], text: state.caption }); toast('ส่งการ์ดแล้ว'); return; } catch (e) { if (e && e.name === 'AbortError') return; }\n      }\n      await download();\n      const ok = await copyText(state.caption);\n      toast(ok ? 'บันทึกรูปแล้ว และคัดลอกข้อความให้แล้ว วางในแอปที่ต้องการได้เลย' : 'บันทึกรูปแล้ว กด \"คัดลอกข้อความ\" เพื่อคัดลอกข้อความ');\n    };\n\n    const fmtBtns = ['portrait', 'square'].map((f) => h('button', {\n      class: 'btn' + (state.format === f ? ' on' : ''), 'aria-pressed': String(state.format === f),\n      onClick: async () => { state.format = f; await redraw(); mainView(); }, text: f === 'portrait' ? 'แนวตั้ง' : 'จัตุรัส',\n    }));\n    const c = outcome.coins;\n    const coinRows = [['เหรียญพื้นฐาน', c.base], ['คะแนนความรู้', c.perf], ['คะแนนป้อมปราการ', c.defenseBon], ['ปลดล็อกใหม่', c.newUnlocks], ['ได้ซ้ำ', c.repeats], ['กระปุกออมสิน', c.piggyPaid]].filter((r) => r[1] > 0);\n    const wk = E.weeklyStamps(profile);\n    const days = ['จ.', 'อ.', 'พ.', 'พฤ.', 'ศ.', 'ส.', 'อา.'];\n    const dc = outcome.daily.challenge;\n    // dress the card right here: wear / take off what you own (hat, frame, sticker), the card redraws at once\n    function decorPanel() {\n      const eq = profile.cosmetics.equipped, owned = profile.cosmetics.owned;\n      const mine = E.ALL_COSMETICS.filter((c) => owned.includes(c.id) && ['hat', 'frame', 'sticker'].includes(c.type));\n      if (!mine.length) {\n        return h('div', { class: 'panel', 'data-decor': 'none' }, h('h3', { text: 'ของตกแต่งการ์ด' }), h('div', { text: 'ยังไม่มีของตกแต่ง เก็บเหรียญแล้วไปซื้อหมวก กรอบ หรือสติกเกอร์มาใส่ให้การ์ดได้' }),\n          h('div', { class: 'row' }, h('button', { class: 'btn', onClick: shopView, text: 'ไปร้านค้าตกแต่ง' })));\n      }\n      return h('div', { class: 'panel', 'data-decor': 'on' }, h('h3', { text: 'ของตกแต่งการ์ด (แตะเพื่อใส่ / ถอด)' }),\n        h('div', { class: 'row' }, ...mine.map((c) => {\n          const on = eq[c.type] === c.id;\n          return h('button', { class: 'btn' + (on ? ' on' : ''), 'aria-pressed': String(on), 'data-cos': c.id, text: (on ? '✓ ' : '') + c.nameTh, onClick: async () => { E.equipCosmetic(profile, c.id); E.rememberLook(profile, outcome); E.saveProfile(profile); await redraw(); mainView(); animate(); } });\n        })));\n    }\n    const frag = h('div', { class: 'wrap' },\n      h('h2', { text: 'การ์ดของคุณ' }),\n      outcome.short ? h('div', { class: 'panel', text: 'รอบนี้สั้นกว่า 4 นาที จึงเป็นการ \"ทดลองบิน\" ได้เฉพาะเหรียญพื้นฐาน เล่นให้ครบรอบเพื่อรับฉายาเต็มรูปแบบ' }) : null,\n      h('div', { class: 'card-box' }, canvas),\n      decorPanel(),\n      h('div', { class: 'row' }, fmtBtns),\n      hasCursed ? h('div', { class: 'row' }, h('button', {\n        class: 'btn' + (outcome.considerate ? ' on' : ''), 'aria-pressed': String(!!outcome.considerate),\n        onClick: async () => { profile.considerate = !outcome.considerate; E.applyConsiderate(outcome, profile.considerate); E.saveProfile(profile); resetCaption(); await redraw(); mainView(); animate(); },\n        text: outcome.considerate ? 'โหมดเกรงใจ: เปิดอยู่ (แสดงการ์ดสุภาพ)' : 'โหมดเกรงใจ: ปิด (กดเพื่อซ่อนการ์ดตีกลับ)',\n      })) : null,\n      h('div', { class: 'panel' },\n        h('h3', { text: 'ข้อความสำหรับโพสต์' }), cap,\n        h('div', { class: 'row' },\n          h('button', { class: 'btn', 'aria-label': 'สุ่มข้อความใหม่', onClick: () => { state.captionIdx++; resetCaption(); refreshCap(); }, text: '🔄 ข้อความอื่น' }),\n          h('button', { class: 'btn', onClick: async () => toast((await copyText(state.caption)) ? 'คัดลอกข้อความแล้ว' : 'คัดลอกไม่ได้ ลองเลือกข้อความแล้วคัดลอกเอง'), text: 'คัดลอกข้อความ' }))),\n      h('div', { class: 'row' },\n        h('button', { class: 'btn pri', onClick: share, text: 'แชร์' }),\n        h('button', { class: 'btn', 'data-act': 'download-png', onClick: async () => { await download('image/png'); toast('บันทึกรูปแล้ว'); }, text: 'ดาวน์โหลด' })),\n      h('div', { class: 'panel' },\n        h('h3', { text: `เหรียญรอบนี้ +${c.total}` }),\n        h('table', { class: 'coins' }, ...coinRows.map((r) => h('tr', null, h('td', { text: r[0] }), h('td', { text: '+' + r[1] }))),\n          outcome.daily.bonus ? h('tr', null, h('td', { text: 'แสตมป์ประจำวัน' }), h('td', { text: '+' + outcome.daily.bonus })) : null),\n        h('div', { text: `เหรียญสะสมของคุณ ${profile.coins} เหรียญ` + (profile.piggy ? ` · กระปุกออมสิน ${profile.piggy} (จะจ่ายรอบหน้า)` : '') }),\n        c.raw > E.COIN_CAP && !c.short ? h('div', { text: `ถึงเพดาน ${E.COIN_CAP} เหรียญแล้ว ส่วนเกินเก็บเข้ากระปุกออมสิน` }) : null),\n      h('div', { class: 'panel' },\n        h('h3', { text: 'แสตมป์ประจำวัน' }),\n        dc ? h('div', { text: `${dc.labelTh}${outcome.daily.success ? ' ✔ ได้แสตมป์แล้ว' : outcome.daily.alreadyDone ? ' (วันนี้ได้แสตมป์แล้ว)' : ' (ยังไม่สำเร็จ ลองใหม่ได้)'}` }) : null,\n        h('div', { class: 'stamps' }, ...[0, 1, 2, 3, 4, 5, 6].map((i) => h('span', { class: wk[i] ? 'on' : '', text: days[i] + (wk[i] ? ' ✔' : '') }))),\n        h('div', { text: 'ครบ 5 ใน 7 วัน รับหมวกพิราบประจำสัปดาห์ (ไม่มีสถิติต่อเนื่อง ไม่มีโทษถ้าเว้นวัน)' })),\n      h('div', { class: 'panel' },\n        h('div', { text: 'ชื่อเรียก: ' + E.callsignText(profile) }),\n        h('div', { class: 'row' }, h('button', {\n          class: 'btn', onClick: async () => {\n            const r = E.rerollCallsign(profile);\n            if (!r.ok) { toast(`เหรียญไม่พอ (ต้องใช้ ${r.cost})`); return; }\n            await redraw(); mainView();\n          }, text: profile.callsign.rerolls >= 1 ? 'สุ่มชื่อใหม่ (30 เหรียญ)' : 'สุ่มชื่อใหม่ (ฟรีครั้งแรก)',\n        }))),\n      h('div', { class: 'row' },\n        h('button', { class: 'btn', onClick: collectionView, text: `สมุดสะสมแสตมป์ ${E.collectionCount(profile)}/${E.getAchievements().length}` }),\n        h('button', { class: 'btn', onClick: shopView, text: 'ร้านค้าตกแต่ง' })),\n      h('div', { class: 'row' },\n        onReplay ? h('button', { class: 'btn pri', onClick: () => onReplay(), text: 'เล่นอีกครั้ง' }) : null,\n        onClose ? h('button', { class: 'btn', onClick: () => onClose(), text: 'กลับ' }) : null),\n    );\n    root.replaceChildren(frag);\n    refreshCap();\n    animate();\n  }\n\n  // ---------------------------------------------------------------- collection book\n  async function collectionView() {\n    state.view = 'collection';\n    clearInterval(timer);\n    const gallery = await buildGallery({ profile });\n    const list = E.getAchievements();\n    const have = E.collectionCount(profile);\n    const groups = ['good', 'bad', 'quirk'].map((tone) => h('div', null,\n      h('h3', { text: TONE_TH[tone] }),\n      h('div', { class: 'grid' }, ...list.filter((a) => a.tone === tone).map((a) => {\n        const got = profile.collection[a.id];\n        const hidden = !got && a.rarity === 'legendary';\n        return h('div', { class: 'slot ' + (got ? 'got' : 'locked') + (a.rarity === 'cursed' ? ' cursed' : ''), 'aria-label': got ? a.nameTh : 'ยังไม่ปลดล็อก' },\n          h('div', { text: got ? a.nameTh : hidden ? '???' : '🔒 ' + (got ? '' : '') }),\n          got ? h('div', { text: `${RARITY_STYLE[a.rarity].nameTh} · ได้ ${got.timesEarned} ครั้ง` }) : h('div', { text: a.subTh }));\n      }))));\n    const next = E.REWARDS.find((r) => !profile.cosmetics.owned.includes(r.id));\n    const confirmBox = h('div');\n    root.replaceChildren(h('div', { class: 'wrap' },\n      h('h2', { text: `สมุดสะสมแสตมป์ ${have}/${list.length}` }),\n      h('div', { class: 'panel', text: next ? `สะสมครบ ${next.need} ใบ รับ \"${next.nameTh}\"` : 'สะสมครบทุกรางวัลแล้ว เก่งมาก!' }),\n      h('h3', { text: 'สมุดการ์ด' }), gallery,\n      ...groups,\n      h('div', { class: 'row' },\n        h('button', { class: 'btn', onClick: () => { gallery.destroy(); mainView(); redraw(); }, text: 'กลับ' }),\n        h('button', {\n          class: 'btn', text: 'ล้างสมุดทุกเล่ม (เครื่องส่วนกลาง)', onClick: () => {\n            confirmBox.replaceChildren(h('div', { class: 'panel' }, h('div', { text: 'ล้างสมุด เหรียญ และชื่อเรียกทั้งหมดบนเครื่องนี้ ใช่หรือไม่?' }),\n              h('div', { class: 'row' }, h('button', { class: 'btn pri', text: 'ใช่ ล้างทั้งหมด', onClick: () => { const p = E.resetProfile(); Object.assign(profile, p); toast('ล้างข้อมูลแล้ว'); collectionView(); } }),\n                h('button', { class: 'btn', text: 'ไม่ล้าง', onClick: () => confirmBox.replaceChildren() }))));\n          },\n        })),\n      confirmBox));\n  }\n\n  // ---------------------------------------------------------------- shop\n  function shopView() {\n    state.view = 'shop';\n    clearInterval(timer);\n    const row = (it, buyable) => {\n      const owned = profile.cosmetics.owned.includes(it.id);\n      const eq = profile.cosmetics.equipped[it.type] === it.id;\n      return h('div', { class: 'shop' },\n        h('div', { class: 'nm' }, h('div', { text: it.nameTh }), h('div', { text: `${E.COSMETIC_TYPES[it.type]}${buyable && !owned ? ' · ' + it.price + ' เหรียญ' : ''}${owned ? ' · เป็นเจ้าของแล้ว' : ''}` })),\n        owned ? h('button', { class: 'btn' + (eq ? ' on' : ''), onClick: () => { E.equipCosmetic(profile, it.id); shopView(); }, text: eq ? 'สวมอยู่ · ถอด' : 'สวมใส่' })\n          : buyable ? h('button', { class: 'btn pri', disabled: profile.coins < it.price, onClick: () => { const r = E.buyCosmetic(profile, it.id); toast(r.ok ? 'ซื้อแล้ว' : 'ซื้อไม่ได้'); shopView(); }, text: 'ซื้อ' })\n            : h('span', { text: 'ยังไม่ได้รับ' }));\n    };\n    const ownedExtra = [...E.REWARDS, ...E.WEEKLY_HATS].filter((r) => profile.cosmetics.owned.includes(r.id));\n    root.replaceChildren(h('div', { class: 'wrap' },\n      h('h2', { text: 'ร้านค้าตกแต่ง' }),\n      h('div', { class: 'panel', text: `เหรียญของคุณ ${profile.coins} เหรียญ (ตกแต่งอย่างเดียว ไม่มีผลต่อคะแนน)` }),\n      h('div', { class: 'panel' }, ...E.SHOP.map((it) => row(it, true))),\n      ownedExtra.length ? h('div', { class: 'panel' }, h('h3', { text: 'ของรางวัลที่ได้รับ' }), ...ownedExtra.map((it) => row(it, false))) : null,\n      h('div', { class: 'row' }, h('button', { class: 'btn', onClick: async () => { mainView(); await redraw(); }, text: 'กลับ' }))));\n  }\n\n  // ---------------------------------------------------------------- reveal animation\n  async function reveal() {\n    const steps = [outcome.persona, ...outcome.badges];\n    const ov = h('div', { class: 'reveal', role: 'dialog', 'aria-label': 'ผลฉายา' });\n    const skip = h('button', { class: 'btn', text: 'ข้าม', onClick: () => finish() });\n    let done = false;\n    const finish = () => { if (done) return; done = true; ov.remove(); };\n    root.append(ov);\n    ov.append(h('div', { class: 'sub', text: 'ฉายาของคุณคือ...' }));\n    const name = h('div', { class: 'big pop', text: outcome.persona.nameTh });\n    const subl = h('div', { class: 'sub', text: outcome.persona.subTh });\n    ov.append(name, subl);\n    const bw = h('div', { class: 'row', style: 'justify-content:center' });\n    ov.append(bw, skip);\n    const wait = (ms) => new Promise((r) => setTimeout(r, reduced() ? 0 : ms));\n    await wait(900);\n    for (const b of steps.slice(1)) { if (done) return; bw.append(h('span', { class: 'bdg pop', text: b.nameTh })); await wait(600); }\n    await wait(900);\n    finish();\n  }\n\n  await redraw();\n  mainView();\n  if (!reduced()) reveal();\n  if (commit.milestones && commit.milestones.length) toast('ได้ของรางวัลสะสม: ' + commit.milestones.map((m) => m.nameTh).join(', '));\n  if (commit.weeklyHat) toast('ครบ 5 แสตมป์ รับ ' + commit.weeklyHat.nameTh);\n\n  return {\n    outcome, profile,\n    destroy() { destroyed = true; clearInterval(timer); root.remove(); },\n  };\n}\n\nObject.defineProperty(__exp, \"showShareScreen\", { enumerable: true, get: () => showShareScreen });";
